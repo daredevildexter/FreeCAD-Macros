@@ -1,0 +1,597 @@
+# SPDX-License-Identifier: MIT
+#
+# Copyright (c) 2026 daredevildexter
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+# -*- coding: utf-8 -*-
+"""
+Parting_Line_Silhouette.FCMacro
+-------------------------------
+Creates the parting line (silhouette curve) on selected faces for a given
+mould draw direction, i.e. the curve where   normal . draw_direction = 0.
+
+Workflow (a small dialog guides you):
+  1. Select the draw direction and click button 1. Accepted selections:
+       - a straight edge (model edge, sketch line, datum line)
+       - an origin axis (X_Axis / Y_Axis / Z_Axis in the tree)
+       - two vertices (direction = vertex1 -> vertex2)
+       - a planar face (its normal)
+  2. Select one or more curved faces and click button 2
+     (repeat as often as you like; a whole object adds all its faces).
+  3. Click button 3. One curve object per silhouette curve is created
+     in the group "PartingLines".
+
+Notes
+  - Works on any face type (revolved, B-spline, fillets...), trimmed or not.
+  - The curve is traced numerically on the face (UV grid + marching squares,
+    refined by bisection), then clipped to the trimmed face boundary.
+  - Faces that are parallel to the draw direction everywhere (zero draft)
+    have no silhouette; their boundary edges are the parting line instead.
+"""
+
+import FreeCAD
+import FreeCADGui as Gui
+import Part
+from FreeCAD import Vector
+
+try:
+    from PySide import QtCore, QtGui, QtWidgets
+except ImportError:                      # older FreeCAD
+    from PySide import QtCore, QtGui
+    QtWidgets = QtGui
+
+
+# ======================================================================
+#  Core geometry
+# ======================================================================
+
+def _poly_len(pts):
+    return sum((pts[i + 1] - pts[i]).Length for i in range(len(pts) - 1))
+
+
+def _join_chains(chains, tol):
+    """Join open chains whose end points coincide in 3D (periodic seams).
+    chains: list of lists of (u, v, P).  Returns list of (points, closed)."""
+    chains = [list(c) for c in chains]
+    done = []
+    while chains:
+        c = chains.pop()
+        closed = False
+        while True:
+            if len(c) > 2 and (c[0][2] - c[-1][2]).Length < tol:
+                c = c[:-1]
+                closed = True
+                break
+            hit = False
+            for k, o in enumerate(chains):
+                if (c[-1][2] - o[0][2]).Length < tol:
+                    c = c + o[1:]
+                elif (c[-1][2] - o[-1][2]).Length < tol:
+                    c = c + o[::-1][1:]
+                elif (c[0][2] - o[-1][2]).Length < tol:
+                    c = o + c[1:]
+                elif (c[0][2] - o[0][2]).Length < tol:
+                    c = o[::-1] + c[1:]
+                else:
+                    continue
+                chains.pop(k)
+                hit = True
+                break
+            if not hit:
+                break
+        done.append((c, closed))
+    return done
+
+
+def silhouette_on_face(face, d, n_cells=120, log=None):
+    """Return a list of (list_of_3D_points, closed) describing the curves
+    where face normal . d == 0, restricted to the trimmed face."""
+    log = log or (lambda m: None)
+    u0, u1, v0, v1 = face.ParameterRange
+    diag = face.BoundBox.DiagonalLength
+    merge_tol = max(1e-5 * diag, 1e-7)
+
+    # ---------- signed function f(u,v) = n . d --------------------------
+    def fval(u, v):
+        try:
+            return face.normalAt(u, v).dot(d)
+        except Exception:
+            pass
+        try:  # poles / singular points: retry slightly inside
+            eu, ev = (u1 - u0) * 1e-6, (v1 - v0) * 1e-6
+            uu = u + eu if u < 0.5 * (u0 + u1) else u - eu
+            vv = v + ev if v < 0.5 * (v0 + v1) else v - ev
+            return face.normalAt(uu, vv).dot(d)
+        except Exception:
+            return None
+
+    def inside(u, v, P):
+        try:
+            return bool(face.isPartOfDomain(u, v))
+        except Exception:
+            try:
+                return bool(face.isInside(P, 1e-6, True))
+            except Exception:
+                return True
+
+    # ---------- grid with roughly square cells ---------------------------
+    um, vm = 0.5 * (u0 + u1), 0.5 * (v0 + v1)
+    lu = _poly_len([face.valueAt(u0 + (u1 - u0) * k / 16.0, vm) for k in range(17)])
+    lv = _poly_len([face.valueAt(um, v0 + (v1 - v0) * k / 16.0) for k in range(17)])
+    lmax = max(lu, lv, 1e-9)
+    nu = int(min(600, max(10, round(n_cells * lu / lmax))))
+    nv = int(min(600, max(10, round(n_cells * lv / lmax))))
+    us = [u0 + (u1 - u0) * i / nu for i in range(nu + 1)]
+    vs = [v0 + (v1 - v0) * j / nv for j in range(nv + 1)]
+    F = [[fval(u, v) for v in vs] for u in us]
+
+    vals = [x for row in F for x in row if x is not None]
+    if not vals:
+        log("   normals could not be evaluated - skipped")
+        return []
+    if max(abs(x) for x in vals) < 1e-7:
+        log("   face is parallel to the draw direction everywhere (zero draft)"
+            " - its boundary edges are the parting line")
+        return []
+    for i in range(nu + 1):
+        for j in range(nv + 1):
+            if F[i][j] is not None and abs(F[i][j]) < 1e-12:
+                F[i][j] = 1e-12
+
+    # ---------- crossings on grid edges (refined by bisection) ----------
+    cross = {}
+
+    def node(key):
+        if key in cross:
+            return cross[key]
+        kind, i, j = key
+        a = (i, j)
+        b = (i + 1, j) if kind == 'h' else (i, j + 1)
+        ua, va = us[a[0]], vs[a[1]]
+        ub, vb = us[b[0]], vs[b[1]]
+        fa = F[a[0]][a[1]]
+        lo, hi = 0.0, 1.0
+        for _ in range(45):
+            mid = 0.5 * (lo + hi)
+            fm = fval(ua + (ub - ua) * mid, va + (vb - va) * mid)
+            if fm is None:
+                break
+            if abs(fm) < 1e-14:
+                lo = hi = mid
+                break
+            if (fm > 0) == (fa > 0):
+                lo = mid
+            else:
+                hi = mid
+        t = 0.5 * (lo + hi)
+        u, v = ua + (ub - ua) * t, va + (vb - va) * t
+        res = (u, v, face.valueAt(u, v))
+        cross[key] = res
+        return res
+
+    # ---------- marching squares ----------------------------------------
+    segs = []
+    for i in range(nu):
+        for j in range(nv):
+            c00, c10 = F[i][j], F[i + 1][j]
+            c11, c01 = F[i + 1][j + 1], F[i][j + 1]
+            if None in (c00, c10, c11, c01):
+                continue
+            eb, er = c00 * c10 < 0, c10 * c11 < 0
+            et, el = c01 * c11 < 0, c00 * c01 < 0
+            nc = int(eb) + int(er) + int(et) + int(el)
+            if nc == 0:
+                continue
+            B, R, T, L = ('h', i, j), ('v', i + 1, j), ('h', i, j + 1), ('v', i, j)
+            if nc == 2:
+                e = [k for k, f in ((B, eb), (R, er), (T, et), (L, el)) if f]
+                segs.append((e[0], e[1]))
+            elif nc == 4:                       # saddle: decide with centre value
+                fc = fval(0.5 * (us[i] + us[i + 1]), 0.5 * (vs[j] + vs[j + 1]))
+                if fc is None:
+                    fc = 0.25 * (c00 + c10 + c11 + c01)
+                if (fc > 0) == (c00 > 0):
+                    segs += [(B, R), (T, L)]
+                else:
+                    segs += [(B, L), (R, T)]
+    if not segs:
+        log("   no silhouette found on this face")
+        return []
+
+    # ---------- chain segments into polylines ---------------------------
+    adj = {}
+    for a, b in segs:
+        adj.setdefault(a, []).append(b)
+        adj.setdefault(b, []).append(a)
+    visited = set()
+
+    def walk(start):
+        chain = [start]
+        visited.add(start)
+        cur = start
+        while True:
+            nxt = None
+            for x in adj[cur]:
+                if x not in visited:
+                    nxt = x
+                    break
+            if nxt is None:
+                break
+            chain.append(nxt)
+            visited.add(nxt)
+            cur = nxt
+        return chain
+
+    open_chains, closed_chains = [], []
+    for k in list(adj.keys()):
+        if len(adj[k]) == 1 and k not in visited:
+            open_chains.append([node(x) for x in walk(k)])
+    for k in list(adj.keys()):
+        if k not in visited:
+            ch = walk(k)
+            if len(ch) >= 3:
+                closed_chains.append([node(x) for x in ch])
+
+    results = _join_chains(open_chains, merge_tol) + [(c, True) for c in closed_chains]
+
+    # ---------- clip to the trimmed face --------------------------------
+    def snap(u, v):
+        hu, hv = (u1 - u0) * 1e-6, (v1 - v0) * 1e-6
+        for _ in range(4):
+            f0 = fval(u, v)
+            a, b = fval(u + hu, v), fval(u - hu, v)
+            c, e = fval(u, v + hv), fval(u, v - hv)
+            if None in (f0, a, b, c, e) or abs(f0) < 1e-12:
+                break
+            gu, gv = (a - b) / (2 * hu), (c - e) / (2 * hv)
+            g2 = gu * gu + gv * gv
+            if g2 < 1e-18:
+                break
+            u -= f0 * gu / g2
+            v -= f0 * gv / g2
+        return u, v
+
+    def boundary(pin, pout):
+        du, dv = pout[0] - pin[0], pout[1] - pin[1]
+        if abs(du) > 0.5 * (u1 - u0) or abs(dv) > 0.5 * (v1 - v0):
+            return None                     # jump over a periodic seam
+        lo, hi = 0.0, 1.0
+        for _ in range(40):
+            mid = 0.5 * (lo + hi)
+            u, v = pin[0] + du * mid, pin[1] + dv * mid
+            if inside(u, v, face.valueAt(u, v)):
+                lo = mid
+            else:
+                hi = mid
+        u, v = pin[0] + du * lo, pin[1] + dv * lo
+        u2, v2 = snap(u, v)
+        P2 = face.valueAt(u2, v2)
+        if inside(u2, v2, P2):
+            return (u2, v2, P2)
+        return (u, v, face.valueAt(u, v))
+
+    def trim(pts, closed):
+        flags = [inside(p[0], p[1], p[2]) for p in pts]
+        if all(flags):
+            return [(pts, closed)]
+        if not any(flags):
+            return []
+        if closed:
+            k = flags.index(False)
+            pts = pts[k:] + pts[:k + 1]
+            flags = flags[k:] + flags[:k + 1]
+        runs, cur = [], []
+        for idx, p in enumerate(pts):
+            if flags[idx]:
+                if not cur and idx > 0:
+                    bp = boundary(p, pts[idx - 1])
+                    if bp:
+                        cur.append(bp)
+                cur.append(p)
+            elif cur:
+                bp = boundary(pts[idx - 1], p)
+                if bp:
+                    cur.append(bp)
+                runs.append(cur)
+                cur = []
+        if cur:
+            runs.append(cur)
+        return [(r, False) for r in runs if len(r) >= 2]
+
+    out = []
+    for pts, closed in results:
+        for run, cl in trim(pts, closed):
+            P = [p[2] for p in run]
+            if not cl and _poly_len(P) < 1e-4 * diag:
+                continue                    # tiny sliver
+            out.append((P, cl))
+    return out
+
+
+def make_edge(points, closed, fit_tol, diag):
+    """Fit a B-spline through the sampled points -> Part.Edge (or None)."""
+    dup = 1e-6 * diag
+    clean = [points[0]]
+    for p in points[1:]:
+        if (p - clean[-1]).Length > dup:
+            clean.append(p)
+    if closed and len(clean) > 2 and (clean[-1] - clean[0]).Length <= dup:
+        clean.pop()
+    if closed:
+        clean.append(clean[0])
+    if len(clean) < 2:
+        return None
+    if len(clean) == 2:
+        return Part.makeLine(clean[0], clean[1])
+    if len(clean) >= 6:
+        try:
+            bs = Part.BSplineCurve()
+            bs.approximate(Points=clean, DegMin=3, DegMax=8,
+                           Continuity='C2', Tolerance=fit_tol)
+            return bs.toShape()
+        except Exception:
+            pass
+    try:
+        bs = Part.BSplineCurve()
+        bs.interpolate(Points=clean)
+        return bs.toShape()
+    except Exception:
+        return Part.makePolygon(clean)
+
+
+# ======================================================================
+#  Selection helpers
+# ======================================================================
+
+def _get_shape(obj, sub):
+    try:
+        sh = Part.getShape(obj, sub, needSubElement=True)
+        if sh is not None and not sh.isNull():
+            return sh
+    except Exception:
+        pass
+    return None
+
+
+def direction_from_selection():
+    """Return (Vector, description) or raise ValueError."""
+    # 1) origin axes (App::Line)
+    for s in Gui.Selection.getSelectionEx('', 1):
+        o = s.Object
+        if o.TypeId == 'App::Line':
+            try:
+                pl = o.getGlobalPlacement()
+            except Exception:
+                pl = o.Placement
+            return pl.Rotation.multVec(Vector(1, 0, 0)).normalize(), \
+                "origin axis '%s'" % o.Label
+
+    # 2) edges / vertices / planar faces
+    vertices = []
+    for s in Gui.Selection.getSelectionEx('', 0):
+        for sub in (s.SubElementNames or ('',)):
+            sh = _get_shape(s.Object, sub)
+            if sh is None:
+                continue
+            if sh.ShapeType == 'Vertex':
+                vertices.append(sh.Point)
+            elif sh.ShapeType == 'Edge':
+                t0 = sh.tangentAt(sh.FirstParameter)
+                tm = sh.tangentAt(0.5 * (sh.FirstParameter + sh.LastParameter))
+                t1 = sh.tangentAt(sh.LastParameter)
+                if t0.cross(t1).Length < 1e-6 and t0.cross(tm).Length < 1e-6:
+                    return Vector(t0).normalize(), "straight edge %s.%s" % (s.ObjectName, sub)
+                raise ValueError("The selected edge is not straight.")
+            elif sh.ShapeType == 'Face':
+                uu0, uu1, vv0, vv1 = sh.ParameterRange
+                if sh.Surface.TypeId == 'Part::GeomPlane':
+                    n = sh.normalAt(0.5 * (uu0 + uu1), 0.5 * (vv0 + vv1))
+                    return Vector(n).normalize(), "normal of planar face %s.%s" % (s.ObjectName, sub)
+                raise ValueError("Only planar faces can define a direction.")
+    if len(vertices) == 2:
+        v = vertices[1] - vertices[0]
+        if v.Length > 1e-9:
+            return Vector(v).normalize(), "two vertices"
+    raise ValueError("Select a straight edge, an origin axis, two vertices "
+                     "or a planar face first.")
+
+
+def faces_from_selection():
+    """Return list of (key, label, face)."""
+    res = []
+    for s in Gui.Selection.getSelectionEx('', 0):
+        for sub in (s.SubElementNames or ('',)):
+            sh = _get_shape(s.Object, sub)
+            if sh is None:
+                continue
+            if sh.ShapeType == 'Face':
+                res.append(((s.ObjectName, sub), "%s.%s" % (s.ObjectName, sub or "Face"), sh))
+            elif sh.ShapeType in ('Solid', 'Shell', 'Compound', 'CompSolid'):
+                for k, f in enumerate(sh.Faces):
+                    res.append(((s.ObjectName, sub, k + 1),
+                                "%s.Face%d" % (s.ObjectName, k + 1), f))
+    return res
+
+
+# ======================================================================
+#  Dialog
+# ======================================================================
+
+class PartingLineDialog(QtWidgets.QDialog):
+
+    def __init__(self):
+        super(PartingLineDialog, self).__init__(Gui.getMainWindow())
+        self.setWindowTitle("Parting line / silhouette curve")
+        self.direction = None
+        self.faces = {}                       # key -> (label, face)
+
+        lay = QtWidgets.QVBoxLayout(self)
+
+        self.info = QtWidgets.QLabel(
+            "<b>Step 1</b> - select the draw direction (straight edge, origin axis,<br>"
+            "two vertices or planar face), then press the button.")
+        lay.addWidget(self.info)
+
+        self.btn_dir = QtWidgets.QPushButton("1. Use selection as DRAW DIRECTION")
+        self.lbl_dir = QtWidgets.QLabel("Direction: (not set)")
+        lay.addWidget(self.btn_dir)
+        lay.addWidget(self.lbl_dir)
+
+        self.btn_faces = QtWidgets.QPushButton("2. Add selected FACE(S)")
+        self.btn_clear = QtWidgets.QPushButton("Clear faces")
+        self.lbl_faces = QtWidgets.QLabel("Faces: 0")
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(self.btn_faces)
+        row.addWidget(self.btn_clear)
+        lay.addLayout(row)
+        lay.addWidget(self.lbl_faces)
+
+        form = QtWidgets.QFormLayout()
+        self.spin_grid = QtWidgets.QSpinBox()
+        self.spin_grid.setRange(20, 600)
+        self.spin_grid.setValue(120)
+        self.spin_grid.setToolTip("Grid cells along the longer side of each face. "
+                                  "Increase for very wavy or small features.")
+        self.spin_tol = QtWidgets.QDoubleSpinBox()
+        self.spin_tol.setDecimals(4)
+        self.spin_tol.setRange(0.0001, 10.0)
+        self.spin_tol.setSingleStep(0.001)
+        self.spin_tol.setValue(0.005)
+        self.spin_tol.setToolTip("Maximum deviation of the fitted B-spline from the "
+                                 "sampled silhouette points (document units).")
+        form.addRow("Grid resolution:", self.spin_grid)
+        form.addRow("Curve fit tolerance:", self.spin_tol)
+        lay.addLayout(form)
+
+        self.btn_run = QtWidgets.QPushButton("3. CREATE PARTING LINES")
+        lay.addWidget(self.btn_run)
+        self.status = QtWidgets.QLabel("")
+        self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+        self.btn_close = QtWidgets.QPushButton("Close")
+        lay.addWidget(self.btn_close)
+
+        self.btn_faces.setEnabled(False)
+        self.btn_run.setEnabled(False)
+
+        self.btn_dir.clicked.connect(self.pick_direction)
+        self.btn_faces.clicked.connect(self.pick_faces)
+        self.btn_clear.clicked.connect(self.clear_faces)
+        self.btn_run.clicked.connect(self.run)
+        self.btn_close.clicked.connect(self.close)
+
+    # -- steps ----------------------------------------------------------
+    def pick_direction(self):
+        try:
+            d, what = direction_from_selection()
+        except Exception as e:
+            self.status.setText("Direction: %s" % e)
+            return
+        self.direction = d
+        self.lbl_dir.setText("Direction: (%.4f, %.4f, %.4f)  from %s"
+                             % (d.x, d.y, d.z, what))
+        self.info.setText("<b>Step 2</b> - select the curved face(s), press "
+                          "'Add selected FACE(S)'.<br>You can repeat this as often as needed.")
+        self.btn_faces.setEnabled(True)
+        self.status.setText("")
+        Gui.Selection.clearSelection()
+
+    def pick_faces(self):
+        added = faces_from_selection()
+        if not added:
+            self.status.setText("No face found in the current selection.")
+            return
+        for key, label, f in added:
+            self.faces[key] = (label, f)
+        self.lbl_faces.setText("Faces: %d" % len(self.faces))
+        self.btn_run.setEnabled(True)
+        self.info.setText("<b>Step 3</b> - press 'CREATE PARTING LINES' "
+                          "(or add more faces).")
+        self.status.setText("")
+        Gui.Selection.clearSelection()
+
+    def clear_faces(self):
+        self.faces = {}
+        self.lbl_faces.setText("Faces: 0")
+        self.btn_run.setEnabled(False)
+
+    def run(self):
+        if self.direction is None or not self.faces:
+            return
+        doc = FreeCAD.ActiveDocument
+        if doc is None:
+            self.status.setText("No active document.")
+            return
+        d = self.direction
+        n_cells = self.spin_grid.value()
+        fit_tol = self.spin_tol.value()
+        msgs = []
+
+        def log(m):
+            msgs.append(m)
+            FreeCAD.Console.PrintMessage(m + "\n")
+
+        group = None
+        n_curves = 0
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            for key, (label, face) in self.faces.items():
+                log("Face %s:" % label)
+                try:
+                    curves = silhouette_on_face(face, d, n_cells, log)
+                except Exception as e:
+                    log("   error: %s" % e)
+                    continue
+                diag = face.BoundBox.DiagonalLength
+                for k, (pts, closed) in enumerate(curves):
+                    edge = make_edge(pts, closed, fit_tol, diag)
+                    if edge is None:
+                        continue
+                    if group is None:
+                        group = doc.addObject("App::DocumentObjectGroup", "PartingLines")
+                    obj = doc.addObject("Part::Feature", "PartingLine")
+                    obj.Label = "PartingLine_%s_%d" % (label.replace(".", "_"), k + 1)
+                    obj.Shape = edge
+                    group.addObject(obj)
+                    try:
+                        obj.ViewObject.LineColor = (1.0, 0.0, 0.0)
+                        obj.ViewObject.LineWidth = 3.0
+                    except Exception:
+                        pass
+                    n_curves += 1
+                log("   %d curve(s) created" % len(curves))
+            doc.recompute()
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        self.status.setText("Done: %d curve(s) created.\n%s" % (n_curves, "\n".join(msgs[-6:])))
+
+
+_dialog = None
+
+
+def main():
+    global _dialog
+    if FreeCAD.ActiveDocument is None:
+        FreeCAD.Console.PrintError("Open a document first.\n")
+        return
+    _dialog = PartingLineDialog()
+    _dialog.show()
+
+
+main()
