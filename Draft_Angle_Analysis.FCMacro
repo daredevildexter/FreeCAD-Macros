@@ -1,0 +1,673 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+#
+# Draft Angle Analysis macro
+# Copyright (C) 2026 daredevildexter
+#
+# Based on the "Draft Analysis" tool of the Curves workbench
+# (https://github.com/tomate44/CurvesWB)
+# Copyright (C) Christophe Grellier (Chris_G), LGPL-2.1-or-later.
+# Modified: ported to a stand-alone macro, new dialog, numeric per-face report,
+# no persistent document object.
+#
+# This library is free software; you can redistribute it and/or modify it under
+# the terms of the GNU Lesser General Public License as published by the Free
+# Software Foundation; either version 2.1 of the License, or (at your option)
+# any later version.
+#
+# This library is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE. See the GNU Lesser General Public License for more
+# details. A copy of the license is available at
+# https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html
+# -*- coding: utf-8 -*-
+"""
+Draft_Angle_Analysis.FCMacro
+----------------------------
+Stand-alone draft angle analysis for mould design (no Curves workbench needed).
+
+The colour overlay is a port of the "Draft Analysis" tool of the Curves
+workbench by Christophe Grellier (Chris_G),
+https://github.com/tomate44/CurvesWB  (LGPL-2.1-or-later).  The GLSL shader
+and the angle/colour logic are taken from there; this macro adds a dialog,
+a numeric per-face report and removes the need for a persistent document
+object (nothing is added to your document, so files stay clean).
+
+Workflow (a small dialog guides you):
+  1. Select the draw direction and click button 1. Accepted selections:
+       - a straight edge (model edge, sketch line, datum line)
+       - an origin axis (X_Axis / Y_Axis / Z_Axis in the tree)
+       - two vertices (direction = vertex1 -> vertex2)
+       - a planar face (its normal)
+  2. Select the object(s) (or only some faces) and click button 2.
+     The object is coloured by draft angle and a report is produced.
+
+Colours (angle between face normal and draw direction):
+   blue    faces looking along +direction with enough draft
+   cyan    same, but within the tolerance margin above the required draft
+   red     out of draft (insufficient draft or undercut)
+   yellow  faces looking along -direction, within the tolerance margin
+   green   faces looking along -direction with enough draft
+The overlay needs the display mode "Shaded" (set automatically, and the
+original mode is restored when you press "Remove analysis" or close the
+dialog). Click on a face in the 3D view to print its draft angle.
+"""
+
+import os
+import tempfile
+from math import acos, degrees
+
+import numpy as np
+import FreeCAD
+import FreeCADGui as Gui
+import Part
+from FreeCAD import Vector
+from pivy import coin
+
+try:
+    from PySide import QtCore, QtGui, QtWidgets
+except ImportError:                      # older FreeCAD
+    from PySide import QtCore, QtGui
+    QtWidgets = QtGui
+
+
+# ======================================================================
+#  GLSL shaders (from Curves workbench, LGPL-2.1-or-later)
+# ======================================================================
+
+VERT_SHADER = """\
+varying vec4 eposition;
+varying vec3 normal;
+varying vec3 diffuseColor;
+
+void main()
+{
+    gl_Position = gl_ModelViewProjectionMatrix * gl_Vertex;
+    eposition = gl_ModelViewMatrix * gl_Vertex;
+    normal = gl_NormalMatrix * gl_Normal;
+}
+"""
+
+FRAG_SHADER = """\
+#define PI 3.1415926538
+
+varying vec4 eposition;
+varying vec3 normal;
+uniform vec3 analysis_direction;
+uniform float angles[7];
+uniform vec3 colors[8];
+uniform float shading;
+
+void PickColor(in float t,
+               in float tol,
+               inout vec3 color)
+{
+    for (int i=0; i<6; i++)
+    {
+        if ((t >= (angles[i] + tol)) && (t <= (angles[i+1] - tol)))
+        {
+            color = colors[i + 1];
+            return;
+        }
+    }
+    for (int i=0; i<6; i++)
+    {
+        float diff = t - angles[i];
+        if (abs(diff) >= tol)
+            continue;
+        float rel = 0.5 * (1.0 + (diff / tol));
+        color = rel * colors[i + 1] + (1.0 - rel) * colors[i];
+        return;
+    }
+    color = colors[6];
+}
+
+void main(void)
+{
+    vec3 color = colors[0];
+    vec3 dir = vec3(gl_ModelViewMatrix * vec4(analysis_direction, 0.0));
+    float nDotDir = dot(normalize(normal), normalize(dir));
+    float angle = (acos(nDotDir) * 180.0 / PI);
+
+    PickColor(angle, 1e-3, color);
+    // ambient
+    vec3 ambient = gl_FrontMaterial.ambient.rgb;
+    // diffuse
+    vec3 norm = normalize(normal);
+    float diff = dot(norm, dir);
+    vec3 diffuse = 0.5 * (1.0 + diff) * color;
+    // specular
+    vec3 view = vec3(0,0,-1);
+    vec3 reflectDir = reflect(dir, norm);
+    float spec = pow(max(dot(view, reflectDir), 0.0), gl_FrontMaterial.shininess);
+    vec3 specular = 0.5 * spec * gl_FrontMaterial.specular.rgb;
+
+    vec4 result = vec4(ambient, 1.0) + vec4(diffuse, 1.0) + vec4(specular,1.0);
+    gl_FragColor = shading * result + (1.0 - shading) * vec4(color, 1.0);
+}
+"""
+
+_shader_dir = None
+
+
+def _shader_files():
+    """Write the shader sources once to a temp folder, return their paths."""
+    global _shader_dir
+    if _shader_dir is None or not os.path.isdir(_shader_dir):
+        _shader_dir = tempfile.mkdtemp(prefix="fc_draft_analysis_")
+        with open(os.path.join(_shader_dir, "DA_Vert_Shader.glsl"), "w") as f:
+            f.write(VERT_SHADER)
+        with open(os.path.join(_shader_dir, "DA_Frag_Shader.glsl"), "w") as f:
+            f.write(FRAG_SHADER)
+    return (os.path.join(_shader_dir, "DA_Vert_Shader.glsl"),
+            os.path.join(_shader_dir, "DA_Frag_Shader.glsl"))
+
+
+# color order: in-draft(+), tolerance(+), out-of-draft(+), out-of-draft(-),
+#              tolerance(-), in-draft(-)
+COLORS = [(0.0, 0.0, 1.0), (0.0, 1.0, 1.0), (1.0, 0.0, 0.0),
+          (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)]
+
+
+class DraftShader(object):
+    """Coin3D shader node that colours a shape by draft angle."""
+
+    def __init__(self):
+        vpath, fpath = _shader_files()
+        self.vertexShader = coin.SoVertexShader()
+        self.vertexShader.sourceProgram.setValue(vpath)
+        self.fragmentShader = coin.SoFragmentShader()
+        self.fragmentShader.sourceProgram.setValue(fpath)
+
+        self.p_dir = coin.SoShaderParameter3f()
+        self.p_dir.name = "analysis_direction"
+        self.p_angles = coin.SoShaderParameterArray1f()
+        self.p_angles.name = "angles"
+        self.p_colors = coin.SoShaderParameterArray3f()
+        self.p_colors.name = "colors"
+        self.p_shading = coin.SoShaderParameter1f()
+        self.p_shading.name = "shading"
+
+        self.p_dir.value = (0, 0, 1)
+        self.p_shading.value = 0.2
+        self.set_angles(1.0, 1.0, 0.05, 0.05)
+        clist = [COLORS[0]] + COLORS + [COLORS[-1]]
+        self.p_colors.value.setValues(0, len(clist), clist)
+
+        params = [self.p_dir, self.p_angles, self.p_colors, self.p_shading]
+        self.fragmentShader.parameter.setValues(0, len(params), params)
+
+        self.Shader = coin.SoShaderProgram()
+        self.Shader.shaderObject.set1Value(0, self.vertexShader)
+        self.Shader.shaderObject.set1Value(1, self.fragmentShader)
+
+    def set_direction(self, v):
+        self.p_dir.value = (v.x, v.y, v.z)
+
+    def set_shading(self, s):
+        self.p_shading.value = s
+
+    def set_angles(self, a_pos, a_neg, tol_pos, tol_neg):
+        lst = [0.0,
+               90.0 - a_pos - tol_pos,
+               90.0 - a_pos,
+               90.0,
+               90.0 + a_neg,
+               90.0 + a_neg + tol_neg,
+               180.0]
+        self.p_angles.value.setValues(0, len(lst), lst)
+
+
+# ======================================================================
+#  Numeric analysis
+# ======================================================================
+
+def classify(theta, a_pos, tol_pos, a_neg, tol_neg):
+    """theta: angles (deg) between face normal and draw direction.
+    Returns (worst_draft_deg, n_fail, n_marginal, n_samples)."""
+    theta = np.asarray(theta, dtype=float)
+    pos = theta <= 90.0
+    delta = np.where(pos, 90.0 - theta, theta - 90.0)      # draft angle
+    req = np.where(pos, a_pos, a_neg)
+    tol = np.where(pos, tol_pos, tol_neg)
+    fail = delta < req
+    marg = (~fail) & (delta < req + tol)
+    return float(delta.min()), int(fail.sum()), int(marg.sum()), int(theta.size)
+
+
+def sample_thetas(face, d, n=12):
+    """Angles (deg) between normal and d on a UV grid inside the face."""
+    def theta_at(u, v):
+        c = face.normalAt(u, v).dot(d)
+        return degrees(acos(max(-1.0, min(1.0, c))))
+
+    u0, u1, v0, v1 = face.ParameterRange
+    try:
+        if face.Surface.TypeId == 'Part::GeomPlane':
+            return np.array([theta_at(0.5 * (u0 + u1), 0.5 * (v0 + v1))])
+    except Exception:
+        pass
+    out = []
+    for i in range(n):
+        u = u0 + (u1 - u0) * (i + 0.5) / n
+        for j in range(n):
+            v = v0 + (v1 - v0) * (j + 0.5) / n
+            try:
+                if not face.isPartOfDomain(u, v):
+                    continue
+                out.append(theta_at(u, v))
+            except Exception:
+                continue
+    if not out:
+        try:
+            out.append(theta_at(0.5 * (u0 + u1), 0.5 * (v0 + v1)))
+        except Exception:
+            pass
+    return np.array(out)
+
+
+# ======================================================================
+#  Selection helpers
+# ======================================================================
+
+def _get_shape(obj, sub):
+    try:
+        sh = Part.getShape(obj, sub, needSubElement=True)
+        if sh is not None and not sh.isNull():
+            return sh
+    except Exception:
+        pass
+    return None
+
+
+def direction_from_selection():
+    """Return (Vector, description) or raise ValueError."""
+    for s in Gui.Selection.getSelectionEx('', 1):
+        o = s.Object
+        if o.TypeId == 'App::Line':
+            try:
+                pl = o.getGlobalPlacement()
+            except Exception:
+                pl = o.Placement
+            return pl.Rotation.multVec(Vector(1, 0, 0)).normalize(), \
+                "origin axis '%s'" % o.Label
+
+    vertices = []
+    for s in Gui.Selection.getSelectionEx('', 0):
+        for sub in (s.SubElementNames or ('',)):
+            sh = _get_shape(s.Object, sub)
+            if sh is None:
+                continue
+            if sh.ShapeType == 'Vertex':
+                vertices.append(sh.Point)
+            elif sh.ShapeType == 'Edge':
+                t0 = sh.tangentAt(sh.FirstParameter)
+                tm = sh.tangentAt(0.5 * (sh.FirstParameter + sh.LastParameter))
+                t1 = sh.tangentAt(sh.LastParameter)
+                if t0.cross(t1).Length < 1e-6 and t0.cross(tm).Length < 1e-6:
+                    return Vector(t0).normalize(), "straight edge %s.%s" % (s.ObjectName, sub)
+                raise ValueError("The selected edge is not straight.")
+            elif sh.ShapeType == 'Face':
+                uu0, uu1, vv0, vv1 = sh.ParameterRange
+                if sh.Surface.TypeId == 'Part::GeomPlane':
+                    n = sh.normalAt(0.5 * (uu0 + uu1), 0.5 * (vv0 + vv1))
+                    return Vector(n).normalize(), "normal of planar face %s.%s" % (s.ObjectName, sub)
+                raise ValueError("Only planar faces can define a direction.")
+    if len(vertices) == 2:
+        v = vertices[1] - vertices[0]
+        if v.Length > 1e-9:
+            return Vector(v).normalize(), "two vertices"
+    raise ValueError("Select a straight edge, an origin axis, two vertices "
+                     "or a planar face first.")
+
+
+def targets_from_selection():
+    """Return list of dicts: obj (top-level object), faces [(face, subname|None)]."""
+    targets = {}
+    for s in Gui.Selection.getSelectionEx('', 0):
+        obj = s.Object
+        t = targets.setdefault(obj.Name, {"obj": obj, "faces": [], "keys": set()})
+        for sub in (s.SubElementNames or ('',)):
+            if sub in t["keys"]:
+                continue
+            t["keys"].add(sub)
+            sh = _get_shape(obj, sub)
+            if sh is None:
+                continue
+            if sh.ShapeType == 'Face':
+                t["faces"].append((sh, sub))
+            elif sh.ShapeType in ('Solid', 'Shell', 'Compound', 'CompSolid'):
+                plain = False
+                try:
+                    plain = (obj.TypeId.startswith("Part::") and
+                             len(obj.Shape.Faces) == len(sh.Faces))
+                except Exception:
+                    pass
+                for k, f in enumerate(sh.Faces):
+                    t["faces"].append((f, ("Face%d" % (k + 1)) if plain else None))
+    return [t for t in targets.values() if t["faces"]]
+
+
+# ======================================================================
+#  Dialog
+# ======================================================================
+
+class DraftAnalysisDialog(QtWidgets.QDialog):
+
+    def __init__(self):
+        super(DraftAnalysisDialog, self).__init__(Gui.getMainWindow())
+        self.setWindowTitle("Draft angle analysis")
+        self.direction = None
+        self.active = {}          # object name -> dict(obj, vo, node, shader, mode)
+        self.records = []         # (objname, subname|None, thetas, area)
+        self.observing = False
+        self._failing = []
+
+        lay = QtWidgets.QVBoxLayout(self)
+        self.info = QtWidgets.QLabel(
+            "<b>Step 1</b> - select the draw direction (straight edge, origin axis,<br>"
+            "two vertices or planar face), then press the button.")
+        lay.addWidget(self.info)
+
+        self.btn_dir = QtWidgets.QPushButton("1. Use selection as DRAW DIRECTION")
+        self.lbl_dir = QtWidgets.QLabel("Direction: (not set)")
+        lay.addWidget(self.btn_dir)
+        lay.addWidget(self.lbl_dir)
+
+        self.btn_run = QtWidgets.QPushButton("2. Use selected OBJECT(S) and ANALYZE")
+        lay.addWidget(self.btn_run)
+
+        grid = QtWidgets.QGridLayout()
+
+        def spin(val, rng, step, dec=2):
+            s = QtWidgets.QDoubleSpinBox()
+            s.setDecimals(dec)
+            s.setRange(*rng)
+            s.setSingleStep(step)
+            s.setValue(val)
+            s.setSuffix(" deg")
+            return s
+
+        self.s_pos = spin(1.0, (0.0, 89.0), 0.1)
+        self.s_tpos = spin(0.5, (0.0, 89.0), 0.1)
+        self.s_neg = spin(1.0, (0.0, 89.0), 0.1)
+        self.s_tneg = spin(0.5, (0.0, 89.0), 0.1)
+        self.s_shade = QtWidgets.QDoubleSpinBox()
+        self.s_shade.setRange(0.0, 1.0)
+        self.s_shade.setSingleStep(0.05)
+        self.s_shade.setValue(0.2)
+        self.s_pos.setToolTip("Minimum draft for faces looking along +direction")
+        self.s_neg.setToolTip("Minimum draft for faces looking along -direction")
+        self.s_tpos.setToolTip("Margin above the minimum shown in cyan")
+        self.s_tneg.setToolTip("Margin above the minimum shown in yellow")
+        grid.addWidget(QtWidgets.QLabel(""), 0, 0)
+        grid.addWidget(QtWidgets.QLabel("<b>Required draft</b>"), 0, 1)
+        grid.addWidget(QtWidgets.QLabel("<b>Tolerance margin</b>"), 0, 2)
+        grid.addWidget(QtWidgets.QLabel("+ direction side:"), 1, 0)
+        grid.addWidget(self.s_pos, 1, 1)
+        grid.addWidget(self.s_tpos, 1, 2)
+        grid.addWidget(QtWidgets.QLabel("- direction side:"), 2, 0)
+        grid.addWidget(self.s_neg, 2, 1)
+        grid.addWidget(self.s_tneg, 2, 2)
+        grid.addWidget(QtWidgets.QLabel("Shading (0-1):"), 3, 0)
+        grid.addWidget(self.s_shade, 3, 1)
+        lay.addLayout(grid)
+
+        legend = QtWidgets.QLabel(
+            '<span style="color:#0000ff">&#9632;</span> in draft (+) &nbsp;'
+            '<span style="color:#00b0b0">&#9632;</span> marginal (+) &nbsp;'
+            '<span style="color:#ff0000">&#9632;</span> out of draft / undercut &nbsp;'
+            '<span style="color:#c0c000">&#9632;</span> marginal (-) &nbsp;'
+            '<span style="color:#00b000">&#9632;</span> in draft (-)')
+        legend.setWordWrap(True)
+        lay.addWidget(legend)
+
+        self.report = QtWidgets.QPlainTextEdit()
+        self.report.setReadOnly(True)
+        self.report.setMinimumHeight(160)
+        self.report.setMinimumWidth(430)
+        lay.addWidget(self.report)
+
+        self.status = QtWidgets.QLabel("")
+        self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+
+        row = QtWidgets.QHBoxLayout()
+        self.btn_sel = QtWidgets.QPushButton("Select failing faces")
+        self.btn_remove = QtWidgets.QPushButton("Remove analysis")
+        self.btn_close = QtWidgets.QPushButton("Close")
+        row.addWidget(self.btn_sel)
+        row.addWidget(self.btn_remove)
+        row.addWidget(self.btn_close)
+        lay.addLayout(row)
+
+        self.btn_run.setEnabled(False)
+        self.btn_sel.setEnabled(False)
+
+        self.btn_dir.clicked.connect(self.pick_direction)
+        self.btn_run.clicked.connect(self.analyze)
+        self.btn_sel.clicked.connect(self.select_failing)
+        self.btn_remove.clicked.connect(self.remove_analysis)
+        self.btn_close.clicked.connect(self.close)
+        for s in (self.s_pos, self.s_tpos, self.s_neg, self.s_tneg, self.s_shade):
+            s.valueChanged.connect(self.params_changed)
+
+    # -- step 1 ---------------------------------------------------------
+    def pick_direction(self):
+        try:
+            d, what = direction_from_selection()
+        except Exception as e:
+            self.status.setText("Direction: %s" % e)
+            return
+        self.direction = d
+        self.lbl_dir.setText("Direction: (%.4f, %.4f, %.4f)  from %s"
+                             % (d.x, d.y, d.z, what))
+        self.info.setText("<b>Step 2</b> - select the object(s) (or just some faces), "
+                          "then press 'ANALYZE'.")
+        self.btn_run.setEnabled(True)
+        self.status.setText("")
+        Gui.Selection.clearSelection()
+        for rec in self.active.values():          # direction changed
+            self._set_shader_direction(rec)
+
+    # -- step 2 ---------------------------------------------------------
+    def analyze(self):
+        if self.direction is None:
+            return
+        targets = targets_from_selection()
+        if not targets:
+            self.status.setText("Nothing usable selected - select an object or faces.")
+            return
+        d = self.direction
+        self.remove_analysis(keep_observer=True)
+        self.records = []
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            for t in targets:
+                obj = t["obj"]
+                self._apply_shader(obj)
+                for face, sub in t["faces"]:
+                    th = sample_thetas(face, d)
+                    if th.size:
+                        self.records.append((obj.Name, sub, th, face.Area))
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        self._observe(True)
+        self.info.setText("Colours show the draft. Change the angles to re-evaluate "
+                          "instantly.<br>Click a face in the 3D view to print its draft.")
+        self.refresh_report()
+
+    # -- shader handling ------------------------------------------------
+    def _apply_shader(self, obj):
+        vo = obj.ViewObject
+        if vo is None:
+            return
+        mode = None
+        try:
+            mode = vo.DisplayMode
+            vo.DisplayMode = "Shaded"
+        except Exception:
+            pass
+        sw = getattr(vo, "SwitchNode", None)
+        if sw is not None and sw.getNumChildren() == 4:
+            node = sw.getChild(1)               # the "Shaded" node
+        else:
+            node = vo.RootNode
+        shader = DraftShader()
+        rec = {"obj": obj, "vo": vo, "node": node, "shader": shader, "mode": mode}
+        self._set_shader_direction(rec)
+        shader.set_shading(self.s_shade.value())
+        shader.set_angles(self.s_pos.value(), self.s_neg.value(),
+                          self.s_tpos.value(), self.s_tneg.value())
+        node.insertChild(shader.Shader, 0)
+        self.active[obj.Name] = rec
+
+    def _set_shader_direction(self, rec):
+        # the shader works in the object's local frame
+        try:
+            local = rec["obj"].Placement.Rotation.inverted().multVec(self.direction)
+        except Exception:
+            local = self.direction
+        rec["shader"].set_direction(local)
+
+    def params_changed(self):
+        for rec in self.active.values():
+            rec["shader"].set_shading(self.s_shade.value())
+            rec["shader"].set_angles(self.s_pos.value(), self.s_neg.value(),
+                                     self.s_tpos.value(), self.s_tneg.value())
+        if self.records:
+            self.refresh_report()
+
+    def remove_analysis(self, keep_observer=False):
+        for rec in list(self.active.values()):
+            try:
+                rec["node"].removeChild(rec["shader"].Shader)
+            except Exception:
+                pass
+            try:
+                if rec["mode"]:
+                    rec["vo"].DisplayMode = rec["mode"]
+            except Exception:
+                pass
+        self.active = {}
+        if not keep_observer:
+            self._observe(False)
+            self.records = []
+            self.report.setPlainText("")
+            self.btn_sel.setEnabled(False)
+
+    # -- report ---------------------------------------------------------
+    def refresh_report(self):
+        a, ta = self.s_pos.value(), self.s_tpos.value()
+        b, tb = self.s_neg.value(), self.s_tneg.value()
+        rows = []
+        tot_area = fail_area = marg_area = 0.0
+        n_fail = n_marg = 0
+        for name, sub, th, area in self.records:
+            worst, nf, nm, n = classify(th, a, ta, b, tb)
+            tot_area += area
+            fail_area += area * nf / n
+            marg_area += area * nm / n
+            if nf:
+                n_fail += 1
+            elif nm:
+                n_marg += 1
+            rows.append((worst, nf, nm, n, name, sub))
+        pct = lambda x: 100.0 * x / tot_area if tot_area > 0 else 0.0
+        lines = ["Draft required: %.2f deg (+), %.2f deg (-)   margin: %.2f / %.2f deg"
+                 % (a, b, ta, tb),
+                 "Faces analysed: %d   failing: %d   marginal: %d   OK: %d"
+                 % (len(rows), n_fail, n_marg, len(rows) - n_fail - n_marg),
+                 "Area out of draft: %.1f %%    marginal: %.1f %%"
+                 % (pct(fail_area), pct(marg_area)),
+                 ""]
+        bad = sorted([r for r in rows if r[1] or r[2]], key=lambda r: (r[1] == 0, r[0]))
+        if bad:
+            lines.append("Faces needing attention (worst draft first):")
+            for worst, nf, nm, n, name, sub in bad[:40]:
+                state = "FAIL" if nf else "marginal"
+                lines.append("  %-9s %s.%s   worst draft %.2f deg  (%d%% of samples out of draft)"
+                             % (state, name, sub or "(face)", worst, round(100.0 * nf / n)))
+            if len(bad) > 40:
+                lines.append("  ... and %d more" % (len(bad) - 40))
+            lines.append("")
+            lines.append("A face crossing the parting line always shows 'worst draft 0'; "
+                         "split it there (see the Parting Line macro).")
+        else:
+            lines.append("All faces have the required draft.")
+        self.report.setPlainText("\n".join(lines))
+        self._failing = [(r[4], r[5]) for r in bad if r[1] and r[5]]
+        self.btn_sel.setEnabled(bool(self._failing))
+
+    def select_failing(self):
+        Gui.Selection.clearSelection()
+        doc = FreeCAD.ActiveDocument
+        n = 0
+        for name, sub in self._failing:
+            try:
+                Gui.Selection.addSelection(doc.Name, name, sub)
+                n += 1
+            except Exception:
+                pass
+        self.status.setText("%d failing face(s) selected." % n)
+
+    # -- click on a face prints its draft ------------------------------
+    def _observe(self, on):
+        if on and not self.observing:
+            Gui.Selection.addObserver(self)
+            self.observing = True
+        elif not on and self.observing:
+            try:
+                Gui.Selection.removeObserver(self)
+            except Exception:
+                pass
+            self.observing = False
+
+    def addSelection(self, doc, obj, sub, pnt):        # Selection observer API
+        try:
+            if obj not in self.active or "Face" not in sub or self.direction is None:
+                return
+            o = FreeCAD.getDocument(doc).getObject(obj)
+            face = Part.getShape(o, sub, needSubElement=True)
+            P = Vector(pnt)
+            u, v = face.Surface.parameter(P)
+            if (face.valueAt(u, v) - P).Length > 1e-3 * max(face.BoundBox.DiagonalLength, 1.0):
+                return
+            theta = degrees(face.normalAt(u, v).getAngle(self.direction))
+            draft = 90.0 - theta if theta <= 90.0 else theta - 90.0
+            side = "+" if theta <= 90.0 else "-"
+            msg = ("%s.%s  angle to draw direction %.2f deg, draft %.2f deg (%s side)\n"
+                   % (obj, sub, theta, draft, side))
+            FreeCAD.Console.PrintMessage(msg)
+            self.status.setText(msg.strip())
+        except Exception:
+            pass
+
+    # -- closing --------------------------------------------------------
+    def closeEvent(self, ev):
+        self.remove_analysis()
+        super(DraftAnalysisDialog, self).closeEvent(ev)
+
+    def reject(self):
+        self.remove_analysis()
+        super(DraftAnalysisDialog, self).reject()
+
+
+_dialog = None
+
+
+def main():
+    global _dialog
+    if FreeCAD.ActiveDocument is None:
+        FreeCAD.Console.PrintError("Open a document first.\n")
+        return
+    if _dialog is not None:
+        try:
+            _dialog.remove_analysis()
+            _dialog.close()
+        except Exception:
+            pass
+    _dialog = DraftAnalysisDialog()
+    _dialog.show()
+
+
+main()
