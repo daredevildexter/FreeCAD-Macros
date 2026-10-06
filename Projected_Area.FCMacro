@@ -1,0 +1,434 @@
+# SPDX-License-Identifier: MIT
+#
+# Copyright (c) 2026 daredevildexter
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+# -*- coding: utf-8 -*-
+"""
+Projected_Area.FCMacro
+----------------------
+Calculates the projected area of a part along the mould draw direction
+(the area of its "shadow" seen along the pull direction) for injection
+moulding machine / clamping-force selection.
+
+Workflow (a small dialog guides you):
+  1. Select the draw direction and click button 1. Accepted selections:
+       - a straight edge (model edge, sketch line, datum line)
+       - an origin axis (X_Axis / Y_Axis / Z_Axis in the tree)
+       - two vertices (direction = vertex1 -> vertex2)
+       - a planar face (its normal)
+  2. Select the object(s) / shape(s) / part(s) - or only some faces - and
+     click button 2. The area is calculated immediately and shown in the
+     length units your FreeCAD session uses (Preferences > General > Units).
+
+Method
+  The shape is tessellated finely, every triangle is projected onto a plane
+  perpendicular to the draw direction, and the area of the UNION of all
+  projected triangles is computed. The union is evaluated exactly along
+  one direction (interval union per scan line) and numerically (midpoint
+  rule) along the other, so overlaps, holes, undercuts and non-convex
+  shapes are all handled correctly. Faces parallel to the draw direction
+  add nothing, as they should.
+
+Optional extras for machine selection: number of cavities and cavity
+pressure give an estimate of the required clamping force.
+"""
+
+import numpy as np
+import FreeCAD
+import FreeCADGui as Gui
+import Part
+from FreeCAD import Vector
+
+try:
+    from PySide import QtCore, QtGui, QtWidgets
+except ImportError:                      # older FreeCAD
+    from PySide import QtCore, QtGui
+    QtWidgets = QtGui
+
+
+# ======================================================================
+#  Core: area of the union of 2D triangles
+# ======================================================================
+
+def union_area_2d(tris, rows=4000, chunk_pairs=1500000):
+    """tris: ndarray (n, 3, 2). Returns area of the union of the triangles.
+    Exact along x (interval union per scan line), midpoint rule along y."""
+    tris = np.asarray(tris, dtype=float)
+    if tris.size == 0:
+        return 0.0
+    ymin, ymax = tris[:, :, 1].min(), tris[:, :, 1].max()
+    xmin, xmax = tris[:, :, 0].min(), tris[:, :, 0].max()
+    h = (ymax - ymin) / rows
+    if h <= 0:
+        return 0.0
+    width = max(xmax - xmin, 1e-12)
+
+    tmin = tris[:, :, 1].min(axis=1)
+    tmax = tris[:, :, 1].max(axis=1)
+    j0 = np.clip(np.ceil((tmin - ymin) / h - 0.5), 0, rows - 1).astype(np.int64)
+    j1 = np.clip(np.floor((tmax - ymin) / h - 0.5), 0, rows - 1).astype(np.int64)
+    counts = np.maximum(j1 - j0 + 1, 0)
+    # a triangle clipped away entirely (tmax < first row centre) gets count 0
+    counts[(tmax - ymin) / h - 0.5 < 0] = 0
+    keep = np.nonzero(counts)[0]
+    if keep.size == 0:
+        return 0.0
+
+    R_all, LO_all, HI_all = [], [], []
+    start = 0
+    cum = np.cumsum(counts[keep])
+    while start < keep.size:
+        base = cum[start - 1] if start > 0 else 0
+        end = int(np.searchsorted(cum, base + chunk_pairs, side='right'))
+        end = max(end, start + 1)
+        idx = keep[start:end]
+        c = counts[idx]
+        total = int(c.sum())
+        tri = np.repeat(idx, c)
+        first = np.repeat(np.cumsum(c) - c, c)
+        row = j0[tri] + (np.arange(total) - first)
+        yc = ymin + (row + 0.5) * h
+        lo = np.full(total, np.inf)
+        hi = np.full(total, -np.inf)
+        for a, b in ((0, 1), (1, 2), (2, 0)):
+            ya, yb = tris[tri, a, 1], tris[tri, b, 1]
+            xa, xb = tris[tri, a, 0], tris[tri, b, 0]
+            dy = yb - ya
+            m = (yc >= np.minimum(ya, yb)) & (yc < np.maximum(ya, yb)) & (dy != 0)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                x = xa + (yc - ya) * (xb - xa) / dy
+            lo = np.where(m, np.minimum(lo, x), lo)
+            hi = np.where(m, np.maximum(hi, x), hi)
+        ok = np.isfinite(lo) & np.isfinite(hi) & (hi > lo)
+        R_all.append(row[ok])
+        LO_all.append(lo[ok])
+        HI_all.append(hi[ok])
+        start = end
+
+    rws = np.concatenate(R_all)
+    if rws.size == 0:
+        return 0.0
+    lo = np.concatenate(LO_all)
+    hi = np.concatenate(HI_all)
+
+    # union of intervals per row, fully vectorised
+    big = 4.0 * width + 1.0
+    order = np.lexsort((lo, rws))
+    rws, lo, hi = rws[order], lo[order], hi[order]
+    lo = lo + rws * big
+    hi = hi + rws * big
+    run = np.maximum.accumulate(hi)
+    prev = np.concatenate(([-np.inf], run[:-1]))
+    contrib = np.maximum(0.0, hi - np.maximum(lo, prev))
+    return float(contrib.sum() * h)
+
+
+# ======================================================================
+#  FreeCAD side
+# ======================================================================
+
+def plane_basis(d):
+    """Two unit vectors perpendicular to d."""
+    helper = Vector(1, 0, 0) if abs(d.x) < 0.9 else Vector(0, 1, 0)
+    e1 = helper.cross(d)
+    e1.normalize()
+    e2 = d.cross(e1)
+    e2.normalize()
+    return e1, e2
+
+
+def projected_area(shapes, d, rows=4000, rel_tol=5e-5, log=None):
+    """Projected area (internal units, mm^2) of the given shapes along d."""
+    log = log or (lambda m: None)
+    d = Vector(d)
+    d.normalize()
+    e1, e2 = plane_basis(d)
+
+    diag = 0.0
+    for sh in shapes:
+        diag = max(diag, sh.BoundBox.DiagonalLength)
+    if diag <= 0:
+        raise ValueError("The selected shape has no size.")
+    tol = max(rel_tol * diag, 1e-6)
+
+    chunks = []
+    ntri = 0
+    for sh in shapes:
+        if not sh.Faces:
+            continue
+        pts, tri = sh.tessellate(tol)
+        if not pts or not tri:
+            continue
+        P = np.array([[p.dot(e1), p.dot(e2)] for p in pts], dtype=float)
+        T = np.array(tri, dtype=np.int64)
+        chunks.append(P[T])
+        ntri += len(T)
+    if not chunks:
+        raise ValueError("No faces found to project (select a solid, shell or faces).")
+    log("   %d triangles, tessellation deviation %.5g" % (ntri, tol))
+    tris = np.concatenate(chunks, axis=0)
+    return union_area_2d(tris, rows=rows)
+
+
+# ======================================================================
+#  Selection helpers
+# ======================================================================
+
+def _get_shape(obj, sub):
+    try:
+        sh = Part.getShape(obj, sub, needSubElement=True)
+        if sh is not None and not sh.isNull():
+            return sh
+    except Exception:
+        pass
+    return None
+
+
+def direction_from_selection():
+    """Return (Vector, description) or raise ValueError."""
+    # 1) origin axes (App::Line)
+    for s in Gui.Selection.getSelectionEx('', 1):
+        o = s.Object
+        if o.TypeId == 'App::Line':
+            try:
+                pl = o.getGlobalPlacement()
+            except Exception:
+                pl = o.Placement
+            return pl.Rotation.multVec(Vector(1, 0, 0)).normalize(), \
+                "origin axis '%s'" % o.Label
+
+    # 2) edges / vertices / planar faces
+    vertices = []
+    for s in Gui.Selection.getSelectionEx('', 0):
+        for sub in (s.SubElementNames or ('',)):
+            sh = _get_shape(s.Object, sub)
+            if sh is None:
+                continue
+            if sh.ShapeType == 'Vertex':
+                vertices.append(sh.Point)
+            elif sh.ShapeType == 'Edge':
+                t0 = sh.tangentAt(sh.FirstParameter)
+                tm = sh.tangentAt(0.5 * (sh.FirstParameter + sh.LastParameter))
+                t1 = sh.tangentAt(sh.LastParameter)
+                if t0.cross(t1).Length < 1e-6 and t0.cross(tm).Length < 1e-6:
+                    return Vector(t0).normalize(), "straight edge %s.%s" % (s.ObjectName, sub)
+                raise ValueError("The selected edge is not straight.")
+            elif sh.ShapeType == 'Face':
+                uu0, uu1, vv0, vv1 = sh.ParameterRange
+                if sh.Surface.TypeId == 'Part::GeomPlane':
+                    n = sh.normalAt(0.5 * (uu0 + uu1), 0.5 * (vv0 + vv1))
+                    return Vector(n).normalize(), "normal of planar face %s.%s" % (s.ObjectName, sub)
+                raise ValueError("Only planar faces can define a direction.")
+    if len(vertices) == 2:
+        v = vertices[1] - vertices[0]
+        if v.Length > 1e-9:
+            return Vector(v).normalize(), "two vertices"
+    raise ValueError("Select a straight edge, an origin axis, two vertices "
+                     "or a planar face first.")
+
+
+def shapes_from_selection():
+    """Return (list of shapes, list of labels) for the current selection."""
+    shapes, labels = [], []
+    seen = set()
+    for s in Gui.Selection.getSelectionEx('', 0):
+        for sub in (s.SubElementNames or ('',)):
+            key = (s.ObjectName, sub)
+            if key in seen:
+                continue
+            seen.add(key)
+            sh = _get_shape(s.Object, sub)
+            if sh is None or not sh.Faces:
+                continue
+            shapes.append(sh)
+            labels.append("%s%s" % (s.ObjectName, ("." + sub) if sub else ""))
+    return shapes, labels
+
+
+# ======================================================================
+#  Dialog
+# ======================================================================
+
+ACCURACY = {            # name: (scan rows, relative tessellation deviation)
+    "Fast": (2000, 2e-4),
+    "Normal": (4000, 5e-5),
+    "High": (8000, 1e-5),
+}
+
+
+class ProjectedAreaDialog(QtWidgets.QDialog):
+
+    def __init__(self):
+        super(ProjectedAreaDialog, self).__init__(Gui.getMainWindow())
+        self.setWindowTitle("Projected area (injection moulding)")
+        self.direction = None
+        self.area_mm2 = None
+
+        lay = QtWidgets.QVBoxLayout(self)
+        self.info = QtWidgets.QLabel(
+            "<b>Step 1</b> - select the draw direction (straight edge, origin axis,<br>"
+            "two vertices or planar face), then press the button.")
+        lay.addWidget(self.info)
+
+        self.btn_dir = QtWidgets.QPushButton("1. Use selection as DRAW DIRECTION")
+        self.lbl_dir = QtWidgets.QLabel("Direction: (not set)")
+        lay.addWidget(self.btn_dir)
+        lay.addWidget(self.lbl_dir)
+
+        self.btn_calc = QtWidgets.QPushButton("2. Use selected OBJECT(S) and CALCULATE")
+        lay.addWidget(self.btn_calc)
+
+        form = QtWidgets.QFormLayout()
+        self.combo = QtWidgets.QComboBox()
+        self.combo.addItems(list(ACCURACY.keys()))
+        self.combo.setCurrentText("Normal")
+        form.addRow("Accuracy:", self.combo)
+        self.spin_cav = QtWidgets.QSpinBox()
+        self.spin_cav.setRange(1, 512)
+        self.spin_cav.setValue(1)
+        form.addRow("Number of cavities:", self.spin_cav)
+        self.spin_p = QtWidgets.QDoubleSpinBox()
+        self.spin_p.setRange(0.0, 3000.0)
+        self.spin_p.setDecimals(0)
+        self.spin_p.setValue(400.0)
+        self.spin_p.setSuffix(" bar")
+        self.spin_p.setToolTip("Average cavity pressure, only used for the clamping "
+                               "force estimate.")
+        form.addRow("Cavity pressure:", self.spin_p)
+        lay.addLayout(form)
+
+        self.result = QtWidgets.QLabel("")
+        self.result.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        self.result.setWordWrap(True)
+        lay.addWidget(self.result)
+        self.status = QtWidgets.QLabel("")
+        self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+
+        row = QtWidgets.QHBoxLayout()
+        self.btn_copy = QtWidgets.QPushButton("Copy result")
+        self.btn_close = QtWidgets.QPushButton("Close")
+        row.addWidget(self.btn_copy)
+        row.addWidget(self.btn_close)
+        lay.addLayout(row)
+
+        self.btn_calc.setEnabled(False)
+        self.btn_copy.setEnabled(False)
+
+        self.btn_dir.clicked.connect(self.pick_direction)
+        self.btn_calc.clicked.connect(self.calculate)
+        self.btn_copy.clicked.connect(self.copy_result)
+        self.btn_close.clicked.connect(self.close)
+        self.spin_cav.valueChanged.connect(self.update_result)
+        self.spin_p.valueChanged.connect(self.update_result)
+
+    # -- steps ----------------------------------------------------------
+    def pick_direction(self):
+        try:
+            d, what = direction_from_selection()
+        except Exception as e:
+            self.status.setText("Direction: %s" % e)
+            return
+        self.direction = d
+        self.lbl_dir.setText("Direction: (%.4f, %.4f, %.4f)  from %s"
+                             % (d.x, d.y, d.z, what))
+        self.info.setText("<b>Step 2</b> - select the object(s) / part(s) "
+                          "(or just some faces), then press 'CALCULATE'.")
+        self.btn_calc.setEnabled(True)
+        self.status.setText("")
+        Gui.Selection.clearSelection()
+
+    def calculate(self):
+        if self.direction is None:
+            return
+        shapes, labels = shapes_from_selection()
+        if not shapes:
+            self.status.setText("Nothing usable selected - select a solid, "
+                                "shell or faces.")
+            return
+        rows, rel_tol = ACCURACY[self.combo.currentText()]
+        msgs = []
+
+        def log(m):
+            msgs.append(m.strip())
+            FreeCAD.Console.PrintMessage(m + "\n")
+
+        FreeCAD.Console.PrintMessage("Projected area of: %s\n" % ", ".join(labels))
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            self.area_mm2 = projected_area(shapes, self.direction, rows, rel_tol, log)
+        except Exception as e:
+            self.area_mm2 = None
+            self.status.setText("Error: %s" % e)
+            return
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        self.status.setText("Objects: %s\n%s" % (", ".join(labels), "; ".join(msgs)))
+        self.update_result()
+
+    # -- output ---------------------------------------------------------
+    @staticmethod
+    def _user_area(area_mm2):
+        try:
+            return FreeCAD.Units.Quantity(area_mm2, FreeCAD.Units.Area).UserString
+        except Exception:
+            try:
+                return FreeCAD.Units.Quantity("%.12g mm^2" % area_mm2).UserString
+            except Exception:
+                return "%.4f mm^2" % area_mm2
+
+    def result_text(self):
+        if self.area_mm2 is None:
+            return ""
+        a = self.area_mm2
+        n = self.spin_cav.value()
+        p = self.spin_p.value()                       # bar = 0.1 N/mm^2
+        txt = "Projected area (1 cavity): %s" % self._user_area(a)
+        if n > 1:
+            txt += "\nTotal for %d cavities: %s" % (n, self._user_area(a * n))
+        force_kN = a * n * p * 0.1 / 1000.0
+        txt += ("\nClamping force at %.0f bar: %.1f kN  (%.1f tonne-force)"
+                % (p, force_kN, force_kN / 9.80665))
+        return txt
+
+    def update_result(self):
+        txt = self.result_text()
+        self.result.setText("<b>%s</b>" % txt.replace("\n", "<br>") if txt else "")
+        self.btn_copy.setEnabled(bool(txt))
+        if txt:
+            FreeCAD.Console.PrintMessage(txt + "\n")
+
+    def copy_result(self):
+        QtWidgets.QApplication.clipboard().setText(self.result_text())
+
+
+_dialog = None
+
+
+def main():
+    global _dialog
+    if FreeCAD.ActiveDocument is None:
+        FreeCAD.Console.PrintError("Open a document first.\n")
+        return
+    _dialog = ProjectedAreaDialog()
+    _dialog.show()
+
+
+main()
