@@ -19,6 +19,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
+#
 # -*- coding: utf-8 -*-
 """
 Projected_Area.FCMacro
@@ -298,7 +299,7 @@ class ProjectedAreaDialog(QtWidgets.QDialog):
         form = QtWidgets.QFormLayout()
         self.combo = QtWidgets.QComboBox()
         self.combo.addItems(list(ACCURACY.keys()))
-        self.combo.setCurrentText("Normal")
+        self.combo.setCurrentText("Fast")
         form.addRow("Accuracy:", self.combo)
         self.spin_cav = QtWidgets.QSpinBox()
         self.spin_cav.setRange(1, 512)
