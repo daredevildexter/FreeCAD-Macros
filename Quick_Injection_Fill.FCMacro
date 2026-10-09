@@ -1,0 +1,247 @@
+# SPDX-License-Identifier: MIT
+#
+# Copyright (c) 2026 daredevildexter
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+#
+# -*- coding: utf-8 -*-
+# Quick Injection Fill for FreeCAD 1.0
+# Approximate surface-propagation gate study. NOT a molding solver.
+import FreeCAD as App, FreeCADGui as Gui, Mesh, math, heapq, time
+try:
+    from PySide import QtCore, QtGui
+    QtWidgets = QtGui
+except Exception:
+    from PySide2 import QtCore, QtWidgets
+
+NAME_PREFIX = "QuickFill_"
+
+def vkey(v, tol=1e-5):
+    return (int(round(v.x/tol)), int(round(v.y/tol)), int(round(v.z/tol)))
+
+def lerp(a,b,t): return a+(b-a)*t
+
+def ramp(t):
+    # blue -> cyan -> green -> yellow -> orange -> red
+    stops=[(0.0,(0.05,0.15,1.0)),(.2,(0.0,.9,1.0)),(.4,(0.0,.85,.15)),(.6,(1.0,1.0,0.0)),(.8,(1.0,.45,0.0)),(1.0,(1.0,0.05,0.05))]
+    t=max(0.0,min(1.0,t))
+    for i in range(len(stops)-1):
+        if t<=stops[i+1][0]:
+            x0,c0=stops[i]; x1,c1=stops[i+1]; u=(t-x0)/(x1-x0)
+            return tuple(lerp(c0[k],c1[k],u) for k in range(3))
+    return stops[-1][1]
+
+class QuickFill(QtWidgets.QDialog):
+    def __init__(self):
+        super(QuickFill,self).__init__()
+        self.setWindowTitle("Quick Injection Fill")
+        self.resize(500,520)
+        self.gates=[]
+        self.pick_cb=None
+        self.build()
+        self.refresh_parts()
+
+    def build(self):
+        L=QtWidgets.QVBoxLayout(self)
+        info=QtWidgets.QLabel("Approximate surface fill study for early gate-layout checks.\nBlue = early, Red = last. Magenta = estimated front meeting / weld region.")
+        info.setWordWrap(True); L.addWidget(info)
+        r=QtWidgets.QHBoxLayout(); r.addWidget(QtWidgets.QLabel("Part:")); self.part=QtWidgets.QComboBox(); r.addWidget(self.part,1)
+        b=QtWidgets.QPushButton("Refresh"); b.clicked.connect(self.refresh_parts); r.addWidget(b); L.addLayout(r)
+        L.addWidget(QtWidgets.QLabel("Gates")); self.list=QtWidgets.QListWidget(); L.addWidget(self.list)
+        r=QtWidgets.QHBoxLayout()
+        a=QtWidgets.QPushButton("Add Gate (pick point)"); a.clicked.connect(self.start_pick); r.addWidget(a)
+        d=QtWidgets.QPushButton("Remove"); d.clicked.connect(self.remove_gate); r.addWidget(d)
+        c=QtWidgets.QPushButton("Clear"); c.clicked.connect(self.clear_gates); r.addWidget(c); L.addLayout(r)
+        r=QtWidgets.QHBoxLayout(); r.addWidget(QtWidgets.QLabel("Quality:")); self.quality=QtWidgets.QComboBox(); self.quality.addItems(["Fast","Normal","Fine"]); self.quality.setCurrentIndex(0); r.addWidget(self.quality); r.addStretch(); L.addLayout(r)
+        self.weld=QtWidgets.QCheckBox("Estimate weld/front-meeting zones (including same-gate splits)"); self.weld.setChecked(True); L.addWidget(self.weld)
+        self.last=QtWidgets.QCheckBox("Create separate Last Fill zone (final 5%)"); self.last.setChecked(True); L.addWidget(self.last)
+        note=QtWidgets.QLabel("This Version follows a triangulated outer surface. It does not calculate pressure, viscosity, packing, warpage or real fill time.")
+        note.setWordWrap(True); L.addWidget(note)
+        self.bar=QtWidgets.QProgressBar(); self.bar.setRange(0,100); L.addWidget(self.bar)
+        self.status=QtWidgets.QLabel("Ready."); self.status.setWordWrap(True); L.addWidget(self.status)
+        go=QtWidgets.QPushButton("ANALYZE FILL"); go.clicked.connect(self.analyze); L.addWidget(go)
+        close=QtWidgets.QPushButton("Close"); close.clicked.connect(self.close); L.addWidget(close)
+
+    def pump(self,msg=None,p=None):
+        if msg is not None: self.status.setText(msg)
+        if p is not None: self.bar.setValue(int(p))
+        QtWidgets.QApplication.processEvents()
+
+    def refresh_parts(self):
+        self.part.clear(); doc=App.ActiveDocument
+        if not doc: return
+        for o in doc.Objects:
+            try:
+                if hasattr(o,"Shape") and not o.Shape.isNull() and len(o.Shape.Solids)>0 and not o.Name.startswith(NAME_PREFIX):
+                    self.part.addItem(o.Label,o.Name)
+            except: pass
+        sel=Gui.Selection.getSelection()
+        if sel:
+            for i in range(self.part.count()):
+                if self.part.itemData(i)==sel[0].Name: self.part.setCurrentIndex(i); break
+
+    def chosen(self):
+        doc=App.ActiveDocument
+        if not doc or self.part.currentIndex()<0: return None
+        return doc.getObject(self.part.itemData(self.part.currentIndex()))
+
+    def start_pick(self):
+        obj=self.chosen()
+        if not obj: self.status.setText("Select a solid part first."); return
+        self.status.setText("Click a point on the selected part...")
+        try:
+            if self.pick_cb: Gui.ActiveDocument.ActiveView.removeEventCallback("SoEvent",self.pick_cb)
+        except: pass
+        self.pick_cb=Gui.ActiveDocument.ActiveView.addEventCallback("SoEvent",self.on_event)
+
+    def on_event(self,ev):
+        try:
+            if ev.get("Type")!="SoMouseButtonEvent" or ev.get("State")!="DOWN" or ev.get("Button")!="BUTTON1": return
+            pos=ev.get("Position"); hit=Gui.ActiveDocument.ActiveView.getObjectInfo(pos)
+            if not hit: return
+            obj=self.chosen()
+            if hit.get("Object")!=obj.Name: return
+            p=App.Vector(float(hit["x"]),float(hit["y"]),float(hit["z"]))
+            self.gates.append(p); self.update_gates(); self.make_gate_marker(len(self.gates),p)
+            Gui.ActiveDocument.ActiveView.removeEventCallback("SoEvent",self.pick_cb); self.pick_cb=None
+            self.status.setText("Gate added. Add another gate or Analyze.")
+        except Exception as e: self.status.setText("Gate pick problem: %s"%e)
+
+    def update_gates(self):
+        self.list.clear()
+        for i,p in enumerate(self.gates): self.list.addItem("Gate %d: %.3f, %.3f, %.3f mm"%(i+1,p.x,p.y,p.z))
+
+    def make_gate_marker(self,i,p):
+        doc=App.ActiveDocument; n=NAME_PREFIX+"Gate_%02d"%i
+        old=doc.getObject(n)
+        if old: doc.removeObject(n)
+        o=doc.addObject("PartDesign::Feature" if False else "Part::Feature",n)
+        import Part
+        bb=self.chosen().Shape.BoundBox; dia=max(bb.XLength,bb.YLength,bb.ZLength)*0.015; dia=max(dia,0.5)
+        o.Shape=Part.makeSphere(dia,p); o.Label="Quick Fill Gate %d"%i; o.ViewObject.ShapeColor=(1.0,0.0,0.8); o.ViewObject.LineColor=(1.0,0.0,0.8)
+        doc.recompute()
+
+    def remove_gate(self):
+        row=self.list.currentRow()
+        if row<0:return
+        self.gates.pop(row); self.clear_old(prefix=NAME_PREFIX+"Gate_"); self.update_gates()
+        for i,p in enumerate(self.gates,1): self.make_gate_marker(i,p)
+
+    def clear_gates(self): self.gates=[]; self.list.clear(); self.clear_old(prefix=NAME_PREFIX+"Gate_")
+
+    def clear_old(self,prefix=None):
+        doc=App.ActiveDocument
+        if not doc:return
+        pref=prefix or NAME_PREFIX+"Result_"
+        for o in list(doc.Objects):
+            if o.Name.startswith(pref): doc.removeObject(o.Name)
+        doc.recompute()
+
+    def analyze(self):
+        obj=self.chosen()
+        if not obj or not self.gates: self.status.setText("Choose a solid and add at least one gate."); return
+        t0=time.time(); self.clear_old(); self.pump("[1/5] Tessellating analysis surface...",5)
+        # Fine enough to look smooth, but cap by mesh deflection set from bbox.
+        bb=obj.Shape.BoundBox; diag=max(bb.DiagonalLength,1.0)
+        factors={"Fast":0.020,"Normal":0.012,"Fine":0.007}; defl=diag*factors[str(self.quality.currentText())]
+        verts,tri_idx=obj.Shape.tessellate(defl)
+        tris=[]
+        for t in tri_idx:
+            a,b,c=[verts[j] for j in t]; cen=(a+b+c)*(1.0/3.0)
+            tris.append((a,b,c,cen))
+        n=len(tris)
+        if n==0: self.status.setText("No mesh facets generated."); return
+        self.pump("[2/5] Building surface connections (%d facets)..."%n,20)
+        edge_map={}; adj=[[] for _ in range(n)]
+        for i,(a,b,c,cen) in enumerate(tris):
+            ks=[vkey(a),vkey(b),vkey(c)]
+            for x,y in ((ks[0],ks[1]),(ks[1],ks[2]),(ks[2],ks[0])):
+                e=tuple(sorted((x,y))); j=edge_map.get(e)
+                if j is None: edge_map[e]=i
+                else:
+                    w=(cen-tris[j][3]).Length; adj[i].append((j,w)); adj[j].append((i,w))
+            if i%3000==0: QtWidgets.QApplication.processEvents()
+        self.pump("[3/5] Propagating flow fronts...",40)
+        gate_facets=[]
+        for gp in self.gates:
+            gi=min(range(n),key=lambda q:(tris[q][3]-gp).Length); gate_facets.append(gi)
+        INF=1e100; dist=[INF]*n; owner=[None]*n; branch=[None]*n; heap=[]
+        # Give each immediate direction around every gate a branch ID. This enables approximate same-gate rejoin detection.
+        for g,root in enumerate(gate_facets):
+            seeds=[root]+[j for j,w in adj[root]]
+            for k,s in enumerate(seeds):
+                d0=(tris[s][3]-self.gates[g]).Length
+                if d0<dist[s]: dist[s]=d0; owner[s]=g; branch[s]=(g,k); heapq.heappush(heap,(d0,s,g,(g,k)))
+        pops=0
+        while heap:
+            d,i,g,br=heapq.heappop(heap)
+            if d>dist[i]+1e-9: continue
+            for j,w in adj[i]:
+                nd=d+w
+                if nd<dist[j]-1e-9:
+                    dist[j]=nd; owner[j]=g; branch[j]=br; heapq.heappush(heap,(nd,j,g,br))
+            pops+=1
+            if pops%4000==0: QtWidgets.QApplication.processEvents()
+        finite=[x for x in dist if x<INF]
+        if not finite: self.status.setText("Propagation failed: disconnected mesh."); return
+        dmax=max(finite); dmin=min(finite); span=max(dmax-dmin,1e-9)
+        # Weld candidates: neighboring fronts with different gate owners or same gate but different initial branches, away from gate.
+        weldset=set()
+        if self.weld.isChecked():
+            for i in range(n):
+                ti=(dist[i]-dmin)/span
+                if ti<0.18: continue
+                for j,w in adj[i]:
+                    if abs(dist[i]-dist[j]) > max(w*2.5, span*0.025): continue
+                    if owner[i]!=owner[j] or (branch[i]!=branch[j] and ti>0.30): weldset.add(i); weldset.add(j)
+        self.pump("[4/5] Creating clean color map...",70)
+        # 18 color bands: smooth-looking surface, no triangle edge display.
+        bins=[[] for _ in range(18)]; lasttris=[]; weldtris=[]
+        for i,(a,b,c,cen) in enumerate(tris):
+            tt=(dist[i]-dmin)/span if dist[i]<INF else 1.0; k=min(17,int(tt*18)); bins[k].extend([a,b,c])
+            if tt>=0.95: lasttris.extend([a,b,c])
+            if i in weldset: weldtris.extend([a,b,c])
+        doc=App.ActiveDocument
+        for k,pts in enumerate(bins):
+            if not pts: continue
+            mo=doc.addObject("Mesh::Feature",NAME_PREFIX+"Result_Band_%02d"%k); mo.Label="Quick Fill - %02d"%(k+1); mo.Mesh=Mesh.Mesh(pts)
+            col=ramp((k+.5)/18.0); mo.ViewObject.ShapeColor=col; mo.ViewObject.LineColor=col; mo.ViewObject.DisplayMode="Flat Lines" if False else mo.ViewObject.DisplayMode
+            try: mo.ViewObject.LineTransparency=100
+            except: pass
+        if self.last.isChecked() and lasttris:
+            mo=doc.addObject("Mesh::Feature",NAME_PREFIX+"Result_LastFill"); mo.Label="Quick Fill - Last Fill (final 5%)"; mo.Mesh=Mesh.Mesh(lasttris); mo.ViewObject.ShapeColor=(1.0,0.0,0.0); mo.ViewObject.Transparency=25
+        if weldtris:
+            mo=doc.addObject("Mesh::Feature",NAME_PREFIX+"Result_Weld"); mo.Label="Quick Fill - Estimated Weld / Meeting"; mo.Mesh=Mesh.Mesh(weldtris); mo.ViewObject.ShapeColor=(1.0,0.0,1.0); mo.ViewObject.Transparency=0
+        # Balance by number of facets owned by each gate.
+        counts=[owner.count(g) for g in range(len(self.gates))]
+        if len(counts)==1: balance="N/A (single gate)"
+        else:
+            mean=sum(counts)/float(len(counts)); dev=max(abs(c-mean) for c in counts); balance="%.0f%%"%(max(0.0,100.0*(1.0-dev/max(mean,1.0))))
+        try: obj.ViewObject.Visibility=False
+        except: pass
+        doc.recompute(); Gui.activeDocument().activeView().fitAll()
+        self.pump("Done. %d facets, %d gate(s). Fill balance: %s. Weld candidates: %d facets. %.1f s"%(n,len(self.gates),balance,len(weldset),time.time()-t0),100)
+
+    def closeEvent(self,e):
+        try:
+            if self.pick_cb: Gui.ActiveDocument.ActiveView.removeEventCallback("SoEvent",self.pick_cb)
+        except: pass
+        e.accept()
+
+_dlg=QuickFill(); _dlg.show()

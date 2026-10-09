@@ -1,0 +1,1062 @@
+# SPDX-License-Identifier: MIT
+#
+# Copyright (c) 2026 daredevildexter
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+#
+# -*- coding: utf-8 -*-
+"""
+Wall_Thickness_Analysis.FCMacro
+-------------------------------
+Fast wall thickness analysis for injection moulded parts (sphere method).
+
+Method: at every surface sample point the largest sphere that touches the
+surface there, has its centre on the inward normal and stays inside the
+material is determined. Wall thickness = diameter of that sphere. Surface
+points are found with a spatial grid, so the analysis takes a few seconds.
+The result is a colour map (3-colour gradient: minimum / nominal / maximum)
+plus a numeric report. Nothing is added to your document.
+
+Workflow (a small dialog guides you):
+  1. Select the part(s) - a solid, a Body or a Part object (or only some
+     faces of it) - in the tree or in the 3D view.
+  2. Enter minimum / nominal / maximum wall thickness and press ANALYZE.
+     The colours and the report update instantly when you change the values.
+
+Colours:  minimum = blue,  nominal = green,  maximum = red  (blended in
+between, clamped outside), grey = no result.
+Click a face in the 3D view to print the thickness at the clicked point.
+A colour scale (legend) is shown in the top-left corner of the 3D view.
+
+Accuracy: about 0.1 mm on flat and smoothly curved walls (flat walls are
+exact); a few tenths of a mm on strongly curved thin walls. Works on closed
+solids. Values are in FreeCAD's internal unit (mm) for input; results are
+reported in the length units of the session.
+"""
+
+import re
+from math import sqrt, ceil
+from itertools import chain
+
+import numpy as np
+import FreeCAD
+import FreeCADGui as Gui
+import Part
+from FreeCAD import Vector
+from pivy import coin
+
+try:
+    from PySide import QtCore, QtGui, QtWidgets
+except ImportError:                      # older FreeCAD
+    from PySide import QtCore, QtGui
+    QtWidgets = QtGui
+
+
+# ======================================================================
+#  Numeric core (pure numpy)                                  [CORE START]
+# ======================================================================
+
+class Cancelled(Exception):
+    pass
+
+
+def _unit(N):
+    L = np.linalg.norm(N, axis=1, keepdims=True)
+    L[L < 1e-300] = 1.0
+    return N / L
+
+
+def vertex_normals(V, T):
+    """Area weighted vertex normals of an indexed triangle mesh."""
+    tn = np.cross(V[T[:, 1]] - V[T[:, 0]], V[T[:, 2]] - V[T[:, 0]])
+    N = np.zeros_like(V)
+    for k in range(3):
+        np.add.at(N, T[:, k], tn)
+    return _unit(N)
+
+
+def triangle_areas(V, T):
+    return 0.5 * np.linalg.norm(
+        np.cross(V[T[:, 1]] - V[T[:, 0]], V[T[:, 2]] - V[T[:, 0]]), axis=1)
+
+
+def bisect_soup(P, Nr, h, max_iter=60):
+    """Longest-edge bisection of a triangle soup until every edge is <= h.
+    P, Nr: (m, 3, 3) corner positions / normals. Keeps winding. Produces
+    evenly shaped triangles (no slivers) even from long thin triangles."""
+    done_P, done_N = [], []
+    for _ in range(max_iter):
+        e = np.stack([np.linalg.norm(P[:, 1] - P[:, 0], axis=1),
+                      np.linalg.norm(P[:, 2] - P[:, 1], axis=1),
+                      np.linalg.norm(P[:, 0] - P[:, 2], axis=1)], axis=1)
+        small = e.max(axis=1) <= h
+        if small.any():
+            done_P.append(P[small])
+            done_N.append(Nr[small])
+        big = ~small
+        if not big.any():
+            break
+        P, Nr, e = P[big], Nr[big], e[big]
+        k = e.argmax(axis=1)
+        i = np.arange(len(P))
+        a, b, c = P[i, k], P[i, (k + 1) % 3], P[i, (k + 2) % 3]
+        na, nb, nc = Nr[i, k], Nr[i, (k + 1) % 3], Nr[i, (k + 2) % 3]
+        m = 0.5 * (a + b)
+        nm = _unit(0.5 * (na + nb))
+        P = np.concatenate([np.stack([a, m, c], 1), np.stack([m, b, c], 1)])
+        Nr = np.concatenate([np.stack([na, nm, nc], 1), np.stack([nm, nb, nc], 1)])
+    else:
+        done_P.append(P)
+        done_N.append(Nr)
+    return np.concatenate(done_P), np.concatenate(done_N)
+
+
+def weld(P, Nr, q=1e-5):
+    """Merge coincident corners of a triangle soup -> indexed mesh (V, N, T)."""
+    flat = P.reshape(-1, 3)
+    key = np.round(flat / q).astype(np.int64)
+    order = np.lexsort((key[:, 2], key[:, 1], key[:, 0]))
+    ks = key[order]
+    new = np.ones(len(ks), dtype=bool)
+    new[1:] = (ks[1:] != ks[:-1]).any(axis=1)
+    gid = np.cumsum(new) - 1
+    inv = np.empty(len(ks), dtype=np.int64)
+    inv[order] = gid
+    first = order[new]
+    return flat[first], Nr.reshape(-1, 3)[first], inv.reshape(-1, 3)
+
+
+def refine_face(V, N, T, h):
+    P, Nr = bisect_soup(V[T], N[T], h)
+    return weld(P, Nr)
+
+
+def thin_indices(P, fid, cell):
+    """Indices of one point per (cell, face): a hard way to reduce an over-dense
+    cloud (points of different faces stay separate, so thin walls are not merged)."""
+    key = np.column_stack([np.floor(P / cell).astype(np.int64), fid.astype(np.int64)])
+    order = np.lexsort((key[:, 3], key[:, 2], key[:, 1], key[:, 0]))
+    ks = key[order]
+    new = np.ones(len(ks), dtype=bool)
+    new[1:] = (ks[1:] != ks[:-1]).any(axis=1)
+    return order[new]
+
+
+def refine_set(meshes, idxs, h0, budget, progress=None):
+    """Refine the faces idxs to an even spacing h (>= h0) so that the total number
+    of vertices stays near `budget` (refinement never coarsens: if the meshes are
+    already finer, the vertex count simply stays as it is and the caller thins it).
+    Returns ({idx: (V,N,T)}, h)."""
+    area = sum(triangle_areas(meshes[i][0], meshes[i][2]).sum() for i in idxs)
+    h_start = max(h0, sqrt(max(area, 1e-12) / (0.6 * budget)))
+    h, prev = h_start, None
+    for _ in range(8):
+        out = {}
+        for n_, i in enumerate(idxs):
+            if progress and n_ % 20 == 0:
+                progress()
+            out[i] = refine_face(*meshes[i], h=h)
+        total = sum(len(o[0]) for o in out.values())
+        if total <= 1.3 * budget:
+            return out, h
+        if prev is not None and total >= 0.98 * prev:
+            return out, h_start
+        prev = total
+        h *= max(1.1, sqrt(total / budget))
+    return out, h_start
+
+
+class GridIndex(object):
+    """Uniform hash grid over a point cloud (numpy only)."""
+
+    def __init__(self, pts, reach, cell_div=2.0):
+        pts = np.asarray(pts, dtype=float)
+        self.cell = float(reach) / cell_div
+        self.o = pts.min(axis=0) - self.cell
+        ij = np.floor((pts - self.o) / self.cell).astype(np.int64)
+        self.dim = ij.max(axis=0) + 3
+        key = self._key(ij)
+        order = np.argsort(key, kind='stable')
+        self.order = order
+        self.sp = pts[order]
+        self.ukey, self.ustart, self.ucount = np.unique(
+            key[order], return_index=True, return_counts=True)
+        K = int(ceil(cell_div)) + 1
+        rng = range(-K, K + 1)
+        self.offs = []
+        for a in rng:
+            for b in rng:
+                for c in rng:
+                    gap2 = sum(max(0, abs(x) - 1) ** 2 for x in (a, b, c))
+                    if gap2 * self.cell ** 2 <= reach ** 2 + 1e-12:
+                        self.offs.append(np.array((a, b, c), dtype=np.int64))
+
+    def _key(self, ij):
+        return (ij[:, 0] * self.dim[1] + ij[:, 1]) * self.dim[2] + ij[:, 2]
+
+    def candidates(self, Q, chunk=4000, progress=None):
+        """Yield (qi, pi): query index and index into self.sp of every cloud
+        point lying in the cells that can hold points within `reach`."""
+        base_all = np.floor((np.asarray(Q) - self.o) / self.cell).astype(np.int64)
+        nu = len(self.ukey)
+        for s in range(0, len(Q), chunk):
+            if progress:
+                progress()
+            base = base_all[s:s + chunk]
+            for off in self.offs:
+                nij = base + off
+                valid = ((nij >= 0) & (nij < self.dim)).all(axis=1)
+                if not valid.any():
+                    continue
+                nkey = self._key(nij)
+                pos = np.minimum(np.searchsorted(self.ukey, nkey), nu - 1)
+                hit = valid & (self.ukey[pos] == nkey)
+                qi = np.flatnonzero(hit)
+                if qi.size == 0:
+                    continue
+                st = self.ustart[pos[qi]]
+                ct = self.ucount[pos[qi]]
+                tot = int(ct.sum())
+                rep = np.repeat(qi, ct)
+                idx = np.arange(tot) - np.repeat(np.cumsum(ct) - ct, ct) + np.repeat(st, ct)
+                yield s + rep, idx
+
+
+try:                                        # optional, much faster neighbour search
+    from scipy.spatial import cKDTree
+except Exception:                           # pragma: no cover
+    cKDTree = None
+
+
+class KDIndex(object):
+    """Same interface as GridIndex, backed by scipy's cKDTree."""
+
+    def __init__(self, pts, reach):
+        self.sp = np.asarray(pts, dtype=float)
+        self.order = np.arange(len(self.sp))
+        self.reach = float(reach)
+        self.tree = cKDTree(self.sp)
+
+    def candidates(self, Q, chunk=4000, progress=None):
+        Q = np.asarray(Q)
+        for s in range(0, len(Q), chunk):
+            if progress:
+                progress()
+            tq = cKDTree(Q[s:s + chunk])
+            res = tq.sparse_distance_matrix(self.tree, self.reach, output_type='ndarray')
+            if len(res) == 0:
+                continue
+            yield res['i'].astype(np.int64) + s, res['j'].astype(np.int64)
+
+
+def make_index(pts, reach):
+    if cKDTree is not None:
+        return KDIndex(pts, reach)
+    return GridIndex(pts, reach)
+
+
+class ObstacleField(object):
+    """Surface point cloud (with outward normals) used to find the largest
+    inscribed sphere."""
+
+    def __init__(self, cloud, cloud_n, r_cap, spacing):
+        self.r_cap = float(r_cap)
+        self.spacing = float(spacing)
+        self.grid = make_index(cloud, r_cap + 1.0 * spacing)
+        self.sn = np.asarray(cloud_n, dtype=float)[self.grid.order]
+
+    def radii(self, P, Nin, progress=None, sin_phi=0.1):
+        """Radius of the largest sphere that touches the surface at P (centre on
+        the inward normal Nin) and contains no surface point.
+        Point test : sphere tangent at p contains q  <=>  r > |q-p|^2 / (2 n.(q-p)).
+        Plane test : a sphere tangent at p and touching the local surface plane
+                     (point q, outward normal m) has r = (q-p).m / (1 + n.m);
+                     exact on flat walls whatever the sample spacing."""
+        P = np.asarray(P, dtype=float)
+        Nin = np.asarray(Nin, dtype=float)
+        r_cap = self.r_cap
+        hclose2 = (1.0 * self.spacing) ** 2
+        C = P + Nin * r_cap
+        rmin = np.full(len(P), r_cap)
+        g = self.grid
+        lim2 = (r_cap + 1.2 * self.spacing) ** 2
+        for qi, pi in g.candidates(C, progress=progress):
+            q = g.sp[pi]
+            keep = ((q - C[qi]) ** 2).sum(axis=1) <= lim2          # cheap pre-filter
+            if not keep.any():
+                continue
+            qi, pi, q = qi[keep], pi[keep], q[keep]
+            vec = q - P[qi]
+            d2 = (vec * vec).sum(axis=1)
+            n = Nin[qi]
+            nq = (vec * n).sum(axis=1)
+            ok_pt = (nq > sin_phi * np.sqrt(d2)) & (d2 > 1e-12)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                rcand = np.where(ok_pt, d2 / (2.0 * np.maximum(nq, 1e-12)), np.inf)
+            m = self.sn[pi]
+            den = 1.0 + (n * m).sum(axis=1)
+            vm = (vec * m).sum(axis=1)
+            okp = np.flatnonzero((den > 0.3) & (vm > 0) & (d2 > 1e-12))
+            if okp.size:
+                rp = vm[okp] / den[okp]
+                contact = P[qi[okp]] + rp[:, None] * (n[okp] + m[okp])
+                close = ((contact - q[okp]) ** 2).sum(axis=1) <= hclose2
+                sel = okp[close]
+                rcand[sel] = np.minimum(rcand[sel], rp[close])
+            better = rcand < rmin[qi]
+            if better.any():
+                np.minimum.at(rmin, qi[better], rcand[better])
+        return rmin
+
+
+def recover_edges(P, t, vface, r_cap, reach, progress=None):
+    """Near sharp convex edges the sphere tangent at a point is blocked by the
+    neighbouring face, which gives a narrow, false 'thin' band. Inside the same
+    face a point inherits the thickness of a neighbour that is closer than
+    (its sphere radius + reach)."""
+    out = t.copy()
+    r = 0.5 * t
+    grid = make_index(P, r_cap + reach)
+    for qi, pi in grid.candidates(P, progress=progress):
+        ti = grid.order[pi]                                  # target (original index)
+        same = vface[qi] == vface[ti]
+        if not same.any():
+            continue
+        qi, pi, ti = qi[same], pi[same], ti[same]
+        gain = t[qi] > out[ti]
+        if not gain.any():
+            continue
+        qi, pi, ti = qi[gain], pi[gain], ti[gain]
+        d2 = ((grid.sp[pi] - P[qi]) ** 2).sum(axis=1)
+        ok = d2 <= (r[qi] + reach) ** 2
+        if ok.any():
+            np.maximum.at(out, ti[ok], t[qi][ok])
+    return out
+
+
+def assign_nearest(Pm, tm, fm, P, fid, reach):
+    """Value of the nearest measured point (same face) for every point of P.
+    Points without a measured neighbour inside `reach` become NaN."""
+    out = np.full(len(P), np.nan)
+    best = np.full(len(P), np.inf)
+    idx = make_index(Pm, reach)
+    for qi, pi in idx.candidates(P):
+        mi = idx.order[pi]
+        ok = fm[mi] == fid[qi]
+        if not ok.any():
+            continue
+        qi, mi, pi = qi[ok], mi[ok], pi[ok]
+        d2 = ((idx.sp[pi] - P[qi]) ** 2).sum(axis=1)
+        o = np.lexsort((d2, qi))
+        qi, mi, d2 = qi[o], mi[o], d2[o]
+        first = np.ones(len(qi), dtype=bool)
+        first[1:] = qi[1:] != qi[:-1]
+        qi, mi, d2 = qi[first], mi[first], d2[first]
+        better = d2 < best[qi]
+        out[qi[better]] = tm[mi[better]]
+        best[qi[better]] = d2[better]
+    return out
+
+
+def analyze_meshes(meshes, sample_idx, t_cap, progress=None,
+                   h_obst=1.0, n_obst=60000, n_org=12000, min_face_area=0.01,
+                   org_meshes=None):
+    """meshes: list (one per face) of (V, N, T) in global coordinates with
+    outward normals (or None). Returns dict with the refined sample mesh and
+    the wall thickness at every sample point (cap value where >= t_cap)."""
+    progress = progress or (lambda msg=None: None)
+    meshes = [m if (m is not None and len(m[2])) else None for m in meshes]
+    # org_meshes: (coarser) tessellation used for the sample points / colour map
+    om = meshes if org_meshes is None else \
+        [m if (m is not None and len(m[2])) else None for m in org_meshes]
+    all_idx = [i for i, m in enumerate(meshes) if m is not None]
+    sample_idx = [i for i in sample_idx if om[i] is not None]
+    if not all_idx or not sample_idx:
+        raise ValueError("No triangles - nothing to analyse.")
+    # tiny sliver faces (a few nm wide) only produce meaningless values
+    sample_idx = [i for i in sample_idx
+                  if triangle_areas(om[i][0], om[i][2]).sum() >= min_face_area]
+    if not sample_idx:
+        raise ValueError("The selected faces are too small to analyse.")
+
+    progress("Building surface point cloud ...")
+    cl, h = refine_set(meshes, all_idx, h_obst, n_obst, progress)
+    cloud = np.vstack([cl[i][0] for i in all_idx])
+    cloud_n = np.vstack([cl[i][1] for i in all_idx])
+    cloud_f = np.concatenate([np.full(len(cl[i][0]), i) for i in all_idx])
+    del cl
+    # the tessellation may already be finer than needed: thin it to the budget
+    if len(cloud) > 1.3 * n_obst:
+        cell = 0.5 * h
+        keep = np.arange(len(cloud))
+        while len(keep) > 1.3 * n_obst:
+            cell *= 1.25
+            keep = thin_indices(cloud, cloud_f, cell)
+        cloud, cloud_n = cloud[keep], cloud_n[keep]
+        h = max(h, 1.5 * cell)
+
+    progress("Building sample mesh ...")
+    org, h_o = refine_set(om, sample_idx, h, n_org, progress)
+    RV, RN, RT, vf, tf = [], [], [], [], []
+    off = 0
+    for i in sample_idx:
+        V, N, T = org[i]
+        RV.append(V)
+        RN.append(N)
+        RT.append(T + off)
+        vf.append(np.full(len(V), i))
+        tf.append(np.full(len(T), i))
+        off += len(V)
+    RV, RN, RT = np.vstack(RV), np.vstack(RN), np.vstack(RT)
+    vf, tf = np.concatenate(vf), np.concatenate(tf)
+
+    # Too many sample points for the chosen limit: measure an evenly spread subset
+    # (one point per cell and face) and give every other point the value of the
+    # nearest measured point of the same face.
+    sub = None
+    if len(RV) > 1.15 * n_org:
+        cell = h_o
+        sub = np.arange(len(RV))
+        while len(sub) > n_org:
+            cell *= 1.12
+            sub = thin_indices(RV, vf, cell)
+        progress("Evenly distributing %d of %d points over the part ..." % (len(sub), len(RV)))
+    Pm, Nm, fm = (RV, RN, vf) if sub is None else (RV[sub], RN[sub], vf[sub])
+    h_m = h_o if sub is None else cell
+
+    r_cap = 0.5 * t_cap
+    progress("Computing inscribed spheres at %d points ..." % len(Pm))
+    field = ObstacleField(cloud, cloud_n, r_cap, h)
+    bad = np.linalg.norm(RN, axis=1) < 0.5
+    r = field.radii(Pm, -_unit(Nm), progress)
+    t = 2.0 * r
+    progress("Cleaning up edge zones ...")
+    for _ in range(2):                      # two passes also fix 3-face corners
+        t = recover_edges(Pm, t, fm, r_cap, 1.2 * h_m, progress)
+    if sub is not None:
+        t = assign_nearest(Pm, t, fm, RV, vf, 1.75 * cell)
+    t[bad] = np.nan
+    return {"V": RV, "N": RN, "T": RT, "vface": vf, "tface": tf, "thick": t,
+            "field": field, "t_cap": t_cap, "h_obst": h, "h_org": h_o,
+            "n_cloud": len(cloud)}
+
+
+def thickness_stats(res, t_lo, t_hi):
+    """Global and per-face statistics."""
+    th, T = res["thick"], res["T"]
+    areas = triangle_areas(res["V"], T)
+    with np.errstate(all='ignore'):
+        tri = np.nanmean(th[T], axis=1)
+    known = ~np.isnan(tri)
+    tot = max(areas.sum(), 1e-300)
+    g = {"area_thin": float(areas[known & (tri < t_lo)].sum() / tot),
+         "area_thick": float(areas[known & (tri > t_hi)].sum() / tot)}
+    if known.any():
+        g["mean"] = float((areas[known] * tri[known]).sum() / areas[known].sum())
+        g["min"] = float(np.nanmin(th))
+        g["max"] = float(np.nanmax(th))
+        g["min_pos"] = res["V"][int(np.nanargmin(th))]
+    else:
+        g["mean"] = g["min"] = g["max"] = g["min_pos"] = None
+    faces = {}
+    for fi in np.unique(res["vface"]):
+        v = th[res["vface"] == fi]
+        v = v[~np.isnan(v)]
+        faces[int(fi)] = (float(v.min()), float(v.mean()), float(v.max())) if v.size else None
+    return g, faces
+
+
+def colors3(th, t_min, t_nom, t_max):
+    """3-colour gradient: min = blue, nominal = green, max = red."""
+    col = np.tile(np.array([0.6, 0.6, 0.6]), (len(th), 1))
+    k = ~np.isnan(th)
+    t = th[k]
+    blue, green, red = np.array([0, 0.2, 1.0]), np.array([0, 0.85, 0.1]), np.array([1.0, 0, 0])
+    a = np.clip((t - t_min) / max(t_nom - t_min, 1e-9), 0, 1)[:, None]
+    b = np.clip((t - t_nom) / max(t_max - t_nom, 1e-9), 0, 1)[:, None]
+    c = np.where(t[:, None] <= t_nom, blue + a * (green - blue), green + b * (red - green))
+    col[k] = c
+    return col
+
+# ======================================================================
+#                                                              [CORE END]
+# ======================================================================
+
+
+# ======================================================================
+#  FreeCAD side
+# ======================================================================
+
+def face_mesh(face, tol):
+    """Tessellate one face -> (V, N, T) with normals pointing out of the
+    material (checked against the surface normal), or None."""
+    try:
+        pts, tris = face.tessellate(tol)
+    except Exception:
+        return None
+    if not pts or not tris:
+        return None
+    V = np.array([[p.x, p.y, p.z] for p in pts], dtype=float)
+    T = np.array(tris, dtype=np.int64)
+    N = vertex_normals(V, T)
+    try:                                   # orientation check vs. the true surface normal
+        u0, u1, v0, v1 = face.ParameterRange
+        votes, found = 0.0, 0
+        for i in range(3):
+            for j in range(3):
+                if found >= 4:
+                    break
+                u = u0 + (u1 - u0) * (i + 0.5) / 3
+                v = v0 + (v1 - v0) * (j + 0.5) / 3
+                try:
+                    if not face.isPartOfDomain(u, v):
+                        continue
+                    ns = face.normalAt(u, v)
+                    p = face.valueAt(u, v)
+                except Exception:
+                    continue
+                k = int(np.argmin(((V - np.array([p.x, p.y, p.z])) ** 2).sum(1)))
+                votes += float(np.dot(N[k], [ns.x, ns.y, ns.z]))
+                found += 1
+        if found and votes < 0:
+            T = T[:, [0, 2, 1]]
+            N = -N
+    except Exception:
+        pass
+    return V, N, T
+
+
+def get_shape(obj, sub):
+    try:
+        sh = Part.getShape(obj, sub, needSubElement=True)
+        if sh is not None and not sh.isNull():
+            return sh
+    except Exception:
+        pass
+    return None
+
+
+def targets_from_selection():
+    """list of dicts: obj, shape (whole object), sample (set of face indices)."""
+    targets = {}
+    for s in Gui.Selection.getSelectionEx('', 0):
+        obj = s.Object
+        t = targets.setdefault(obj.Name, {"obj": obj, "sample": set(), "all": False})
+        for sub in (s.SubElementNames or ('',)):
+            last = sub.split('.')[-1] if sub else ''
+            m = re.match(r'^Face(\d+)$', last)
+            if m and obj.TypeId.startswith("Part::"):
+                t["sample"].add(int(m.group(1)) - 1)
+            else:
+                t["all"] = True
+    out = []
+    for t in targets.values():
+        sh = get_shape(t["obj"], '')
+        if sh is None or not sh.Faces:
+            continue
+        t["shape"] = sh
+        t["plain"] = False
+        try:
+            t["plain"] = (t["obj"].TypeId.startswith("Part::") and
+                          len(t["obj"].Shape.Faces) == len(sh.Faces))
+        except Exception:
+            pass
+        n = len(sh.Faces)
+        if t["all"] or not t["sample"]:
+            t["sample"] = set(range(n))
+        t["sample"] = {i for i in t["sample"] if 0 <= i < n}
+        out.append(t)
+    return out
+
+
+def user_len(mm):
+    try:
+        return FreeCAD.Units.Quantity(mm, FreeCAD.Units.Length).UserString
+    except Exception:
+        return "%.3f mm" % mm
+
+
+def view_widget():
+    """The widget of the active 3D view (parent for the colour scale)."""
+    try:
+        mdi = Gui.getMainWindow().findChild(QtWidgets.QMdiArea)
+        sub = mdi.activeSubWindow()
+        return sub.widget() if sub is not None else None
+    except Exception:
+        return None
+
+
+def _split_unit(mm):
+    """('2,500', 'mm') style split of a length in the session's units."""
+    s = user_len(mm)
+    parts = s.rsplit(' ', 1)
+    if len(parts) == 2 and not parts[1].replace('.', '').replace(',', '').isdigit():
+        return parts[0], parts[1]
+    return s, ''
+
+
+class LegendWidget(QtWidgets.QWidget):
+    """Vertical colour scale drawn over the 3D view (top-left corner)."""
+
+    def __init__(self, parent):
+        super(LegendWidget, self).__init__(parent)
+        self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)
+        self.limits = (1.0, 2.5, 4.0)
+        self.setGeometry(12, 12, 190, 330)
+
+    def set_limits(self, t_min, t_nom, t_max):
+        self.limits = (t_min, t_nom, t_max)
+        self.update()
+
+    def paintEvent(self, ev):
+        t_min, t_nom, t_max = self.limits
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.Antialiasing)
+        p.setPen(QtCore.Qt.NoPen)
+        p.setBrush(QtGui.QColor(255, 255, 255, 190))
+        p.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 6, 6)
+
+        unit = _split_unit(1.0)[1]
+        bold = QtGui.QFont(self.font())
+        bold.setBold(True)
+        p.setPen(QtGui.QColor(20, 20, 20))
+        p.setFont(bold)
+        p.drawText(12, 22, "Wall thickness")
+        p.setFont(self.font())
+        p.drawText(12, 40, "(sphere method)")
+        if unit:
+            p.drawText(12, 60, unit)
+
+        x0, w = 14, 26
+        y0, y1 = 74, 312                       # top = maximum, bottom = minimum
+        f = (t_nom - t_min) / max(t_max - t_min, 1e-9)
+        f = min(max(f, 0.0), 1.0)
+        grad = QtGui.QLinearGradient(0, y0, 0, y1)
+        grad.setColorAt(0.0, QtGui.QColor(255, 0, 0))
+        grad.setColorAt(1.0 - f, QtGui.QColor(0, 217, 26))
+        grad.setColorAt(1.0, QtGui.QColor(0, 51, 255))
+        p.setBrush(QtGui.QBrush(grad))
+        p.setPen(QtGui.QColor(40, 40, 40))
+        p.drawRect(x0, y0, w, y1 - y0)
+
+        def ypos(v):
+            return y1 - (min(max(v, t_min), t_max) - t_min) / max(t_max - t_min, 1e-9) * (y1 - y0)
+
+        ticks = [(t_min + (t_max - t_min) * i / 5.0, False) for i in range(6)]
+        ticks.append((t_nom, True))
+        fm = QtGui.QFontMetrics(self.font())
+        last_y = None
+        for v, is_nom in sorted(ticks, key=lambda a: -a[0]):
+            y = ypos(v)
+            num = _split_unit(v)[0]
+            if abs(v - t_max) < 1e-9 and not is_nom:
+                num = "> " + num
+            elif abs(v - t_min) < 1e-9 and not is_nom:
+                num = "< " + num
+            p.setPen(QtGui.QColor(40, 40, 40))
+            p.drawLine(x0 + w, int(y), x0 + w + 6, int(y))
+            if last_y is not None and abs(y - last_y) < fm.height() * 0.9 and not is_nom:
+                continue                      # keep the labels readable
+            p.setFont(bold if is_nom else self.font())
+            p.drawText(x0 + w + 10, int(y + fm.ascent() / 2.0 - 1), num + ("  (nominal)" if is_nom else ""))
+            last_y = y
+        p.end()
+
+
+SAMPLE_LIMITS = [25000, 50000, 75000, 100000]   # selectable maximum number of spheres
+
+
+class WallThicknessDialog(QtWidgets.QDialog):
+
+    def __init__(self):
+        super(WallThicknessDialog, self).__init__(Gui.getMainWindow())
+        self.setWindowTitle("Wall thickness analysis (sphere method)")
+        self.results = {}
+        self.observing = False
+        self.view_sg = None
+        self._thin_faces = []
+        self._cancel = False
+        self._busy = False
+        self.legend = None
+
+        lay = QtWidgets.QVBoxLayout(self)
+        self.info = QtWidgets.QLabel(
+            "<b>Step 1</b> - select the part(s) (solid / Body / Part object,<br>"
+            "or only some faces), enter the wall thickness limits, press ANALYZE.")
+        lay.addWidget(self.info)
+
+        form = QtWidgets.QFormLayout()
+
+        def spin(val):
+            s = QtWidgets.QDoubleSpinBox()
+            s.setDecimals(3)
+            s.setRange(0.01, 10000.0)
+            s.setSingleStep(0.1)
+            s.setValue(val)
+            s.setSuffix(" mm")
+            return s
+
+        self.combo_n = QtWidgets.QComboBox()
+        for n in SAMPLE_LIMITS:
+            self.combo_n.addItem("up to %d points%s" % (n, "  (fast)" if n == SAMPLE_LIMITS[0] else ""), n)
+        self.combo_n.setToolTip("Maximum number of inscribed spheres. Parts with more surface "
+                                "points are sampled evenly. More points = finer detail but slower.")
+        form.addRow("Sample points:", self.combo_n)
+
+        self.s_min = spin(1.0)
+        self.s_nom = spin(2.5)
+        self.s_max = spin(4.0)
+        form.addRow("Minimum (blue):", self.s_min)
+        form.addRow("Nominal (green):", self.s_nom)
+        form.addRow("Maximum (red):", self.s_max)
+        lay.addLayout(form)
+
+        bar = QtWidgets.QLabel("  min  \u2192  nominal  \u2192  max")
+        bar.setAlignment(QtCore.Qt.AlignCenter)
+        bar.setStyleSheet("color:white; font-weight:bold; padding:3px;"
+                          "background: qlineargradient(x1:0,y1:0,x2:1,y2:0,"
+                          "stop:0 #0033ff, stop:0.5 #00d91a, stop:1 #ff0000);")
+        lay.addWidget(bar)
+
+        row = QtWidgets.QHBoxLayout()
+        self.btn_run = QtWidgets.QPushButton("1. ANALYZE selected OBJECT(S)")
+        self.btn_cancel = QtWidgets.QPushButton("Cancel")
+        self.btn_cancel.setEnabled(False)
+        row.addWidget(self.btn_run, 3)
+        row.addWidget(self.btn_cancel, 1)
+        lay.addLayout(row)
+
+        self.report = QtWidgets.QPlainTextEdit()
+        self.report.setReadOnly(True)
+        self.report.setMinimumHeight(170)
+        self.report.setMinimumWidth(440)
+        lay.addWidget(self.report)
+        self.status = QtWidgets.QLabel("")
+        self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+
+        row = QtWidgets.QHBoxLayout()
+        self.btn_sel = QtWidgets.QPushButton("Select thin faces")
+        self.btn_remove = QtWidgets.QPushButton("Remove analysis")
+        self.btn_close = QtWidgets.QPushButton("Close")
+        row.addWidget(self.btn_sel)
+        row.addWidget(self.btn_remove)
+        row.addWidget(self.btn_close)
+        lay.addLayout(row)
+        self.btn_sel.setEnabled(False)
+
+        self.btn_run.clicked.connect(self.analyze)
+        self.btn_cancel.clicked.connect(self._on_cancel)
+        self.btn_sel.clicked.connect(self.select_thin)
+        self.btn_remove.clicked.connect(self.remove_analysis)
+        self.btn_close.clicked.connect(self.close)
+        for s in (self.s_min, self.s_nom, self.s_max):
+            s.valueChanged.connect(self.params_changed)
+
+    # -- progress / cancel ----------------------------------------------
+    def _on_cancel(self):
+        self._cancel = True
+
+    def _progress(self, msg=None):
+        if msg:
+            self.status.setText(msg)
+        QtWidgets.QApplication.processEvents()
+        if self._cancel:
+            raise Cancelled()
+
+    # -- analysis ---------------------------------------------------------
+    def analyze(self):
+        if self._busy:
+            return
+        targets = targets_from_selection()
+        if not targets:
+            self.status.setText("Nothing usable selected - select a solid, Body "
+                                "or Part object.")
+            return
+        try:
+            self.view_sg = Gui.ActiveDocument.ActiveView.getSceneGraph()
+        except Exception:
+            self.status.setText("No 3D view available.")
+            return
+        t_max = self.s_max.value()
+        t_cap = max(1.1 * t_max, t_max + 0.5)
+        self.remove_analysis(keep_observer=True)
+        self._cancel = False
+        self._busy = True
+        self.btn_run.setEnabled(False)
+        self.btn_cancel.setEnabled(True)
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        msgs = []
+        try:
+            for t in targets:
+                obj, sh = t["obj"], t["shape"]
+                diag = max(sh.BoundBox.DiagonalLength, 1e-9)
+                tol = 0.05                                   # mm, fine tessellation (obstacles)
+                self._progress("%s: tessellating ..." % obj.Name)
+                for _ in range(4):
+                    meshes = []
+                    for k, f in enumerate(sh.Faces):
+                        if k % 25 == 0:
+                            self._progress()
+                        meshes.append(face_mesh(f, tol))
+                    nv = sum(len(m[0]) for m in meshes if m is not None)
+                    if nv <= 400000:
+                        break
+                    tol *= 2.0
+                # coarser tessellation for the sample points / colour map, so that the
+                # number of spheres stays near the chosen limit however fine the model is
+                n_samples = self.combo_n.currentData() or SAMPLE_LIMITS[0]
+                n_obst = min(200000, max(60000, 2 * n_samples))
+                tol_o = 0.1
+                org = None
+                for _ in range(6):
+                    org = []
+                    for k, f in enumerate(sh.Faces):
+                        if k % 25 == 0:
+                            self._progress()
+                        org.append(face_mesh(f, tol_o) if k in t["sample"] else None)
+                    nvo = sum(len(m[0]) for m in org if m is not None)
+                    if nvo <= 0.8 * n_samples or tol_o >= 0.5:
+                        break
+                    tol_o *= 1.5
+                try:
+                    res = analyze_meshes(meshes, sorted(t["sample"]), t_cap, self._progress,
+                                         n_obst=n_obst, n_org=n_samples, org_meshes=org)
+                except Cancelled:
+                    raise
+                except Exception as e:
+                    msgs.append("%s: %s" % (obj.Name, e))
+                    continue
+                res.update({"obj": obj, "plain": t["plain"], "diag": diag})
+                self.results[obj.Name] = res
+                self._progress("%s: creating colour map ..." % obj.Name)
+                self._make_overlay(res)
+                msgs.append("%s: %d sample points" % (obj.Name, len(res["V"])))
+        except Cancelled:
+            self.remove_analysis(keep_observer=True)
+            msgs = ["Cancelled."]
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+            self._busy = False
+            self.btn_run.setEnabled(True)
+            self.btn_cancel.setEnabled(False)
+        self._observe(bool(self.results))
+        if self.results:
+            self._show_legend()
+            self.info.setText("Change the limits to re-colour instantly. Click a face in the "
+                              "3D view to print the thickness there.")
+        self.status.setText("; ".join(msgs))
+        self.refresh()
+
+    # -- colour map overlay (Coin3D, nothing is added to the document) ----
+    def _colors(self, res):
+        return colors3(res["thick"], self.s_min.value(), self.s_nom.value(), self.s_max.value())
+
+    def _make_overlay(self, res):
+        lift = max(0.08, 2e-5 * res["diag"])
+        P = res["V"] + _unit(res["N"]) * lift
+        n = len(P)
+        sep = coin.SoSeparator()
+        lm = coin.SoLightModel()
+        lm.model = coin.SoLightModel.BASE_COLOR
+        po = coin.SoPolygonOffset()
+        po.factor = -1.0
+        po.units = -1.0
+        po.styles = coin.SoPolygonOffset.FILLED
+        mb = coin.SoMaterialBinding()
+        mb.value = coin.SoMaterialBinding.PER_VERTEX_INDEXED
+        mat = coin.SoMaterial()
+        mat.diffuseColor.setValues(0, n, self._colors(res).tolist())
+        coords = coin.SoCoordinate3()
+        coords.point.setValues(0, n, P.tolist())
+        idx = np.hstack([res["T"], -np.ones((len(res["T"]), 1), dtype=np.int64)])
+        ifs = coin.SoIndexedFaceSet()
+        ifs.coordIndex.setValues(0, idx.size, idx.ravel().tolist())
+        for node in (lm, po, mb, mat, coords, ifs):
+            sep.addChild(node)
+        self.view_sg.addChild(sep)
+        res["sep"] = sep
+        res["mat"] = mat
+
+    def _show_legend(self):
+        try:
+            if self.legend is None:
+                vw = view_widget()
+                if vw is None:
+                    return
+                self.legend = LegendWidget(vw)
+            self.legend.set_limits(self.s_min.value(), self.s_nom.value(), self.s_max.value())
+            self.legend.show()
+            self.legend.raise_()
+        except Exception:
+            self.legend = None
+
+    def _hide_legend(self):
+        if self.legend is not None:
+            try:
+                self.legend.hide()
+                self.legend.deleteLater()
+            except Exception:
+                pass
+            self.legend = None
+
+    def params_changed(self):
+        if self.legend is not None:
+            self.legend.set_limits(self.s_min.value(), self.s_nom.value(), self.s_max.value())
+        for res in self.results.values():
+            try:
+                col = self._colors(res)
+                res["mat"].diffuseColor.setValues(0, len(col), col.tolist())
+            except Exception:
+                pass
+        if self.results:
+            self.refresh()
+
+    # -- report ---------------------------------------------------------
+    def refresh(self):
+        lo, hi = self.s_min.value(), self.s_max.value()
+        lines = ["Limits: min %s   nominal %s   max %s"
+                 % (user_len(lo), user_len(self.s_nom.value()), user_len(hi)), ""]
+        self._thin_faces = []
+        for name, res in self.results.items():
+            if hi > res["t_cap"] / 1.1 + 1e-9:
+                lines.append("NOTE: maximum was raised after the analysis - press ANALYZE "
+                             "again to measure walls above %s." % user_len(res["t_cap"] / 1.1))
+            g, faces = thickness_stats(res, lo, hi)
+            lines.append("== %s ==" % name)
+            if g["min"] is None:
+                lines.append("   no thickness could be determined (open shell?)")
+                continue
+            p = g["min_pos"]
+            lines.append("   thinnest: %s   at (%.2f, %.2f, %.2f)" % (user_len(g["min"]), p[0], p[1], p[2]))
+            top = "%s (or more)" % user_len(g["max"]) if g["max"] >= res["t_cap"] - 1e-6 else user_len(g["max"])
+            lines.append("   thickest: %s" % top)
+            lines.append("   mean (area weighted): %s" % user_len(g["mean"]))
+            lines.append("   area thinner than min: %.1f %%    thicker than max: %.1f %%"
+                         % (100 * g["area_thin"], 100 * g["area_thick"]))
+            bad = sorted([(v[0], fi, v) for fi, v in faces.items()
+                          if v is not None and (v[0] < lo or v[2] > hi)])
+            if bad:
+                lines.append("   faces outside the limits (thinnest first):")
+                for tmin_f, fi, v in bad[:30]:
+                    flag = "THIN " if v[0] < lo else "THICK"
+                    lines.append("     %s %s.Face%d  min %s  max %s"
+                                 % (flag, name, fi + 1, user_len(v[0]), user_len(v[2])))
+                    if v[0] < lo and res["plain"]:
+                        self._thin_faces.append((name, "Face%d" % (fi + 1)))
+                if len(bad) > 30:
+                    lines.append("     ... and %d more" % (len(bad) - 30))
+            else:
+                lines.append("   all measured faces are within the limits")
+            lines.append("")
+        self.report.setPlainText("\n".join(lines))
+        self.btn_sel.setEnabled(bool(self._thin_faces))
+
+    def select_thin(self):
+        Gui.Selection.clearSelection()
+        doc = FreeCAD.ActiveDocument
+        n = 0
+        for name, sub in self._thin_faces:
+            try:
+                Gui.Selection.addSelection(doc.Name, name, sub)
+                n += 1
+            except Exception:
+                pass
+        self.status.setText("%d thin face(s) selected." % n)
+
+    # -- click probing --------------------------------------------------
+    def _observe(self, on):
+        if on and not self.observing:
+            Gui.Selection.addObserver(self)
+            self.observing = True
+        elif not on and self.observing:
+            try:
+                Gui.Selection.removeObserver(self)
+            except Exception:
+                pass
+            self.observing = False
+
+    def addSelection(self, doc, obj, sub, pnt):        # Selection observer API
+        try:
+            if self._busy or obj not in self.results or "Face" not in sub:
+                return
+            res = self.results[obj]
+            o = FreeCAD.getDocument(doc).getObject(obj)
+            face = get_shape(o, sub)
+            P = Vector(pnt)
+            u, v = face.Surface.parameter(P)
+            if (face.valueAt(u, v) - P).Length > 1e-3 * max(res["diag"], 1.0):
+                return
+            n = face.normalAt(u, v)
+            r = res["field"].radii(np.array([[P.x, P.y, P.z]]),
+                                   np.array([[-n.x, -n.y, -n.z]]))[0]
+            t = 2.0 * float(r)
+            if t >= res["t_cap"] - 1e-6:
+                msg = "%s.%s  wall thickness at clicked point: > %s\n" % (obj, sub, user_len(res["t_cap"]))
+            else:
+                msg = "%s.%s  wall thickness at clicked point: %s\n" % (obj, sub, user_len(t))
+            FreeCAD.Console.PrintMessage(msg)
+            self.status.setText(msg.strip())
+        except Exception:
+            pass
+
+    # -- cleanup --------------------------------------------------------
+    def remove_analysis(self, keep_observer=False):
+        self._hide_legend()
+        for res in self.results.values():
+            try:
+                self.view_sg.removeChild(res["sep"])
+            except Exception:
+                pass
+        self.results = {}
+        if not keep_observer:
+            self._observe(False)
+            self.report.setPlainText("")
+            self.btn_sel.setEnabled(False)
+
+    def closeEvent(self, ev):
+        self._cancel = True
+        self.remove_analysis()
+        super(WallThicknessDialog, self).closeEvent(ev)
+
+    def reject(self):
+        self._cancel = True
+        self.remove_analysis()
+        super(WallThicknessDialog, self).reject()
+
+
+_dialog = None
+
+
+def main():
+    global _dialog
+    if FreeCAD.ActiveDocument is None:
+        FreeCAD.Console.PrintError("Open a document first.\n")
+        return
+    if _dialog is not None:
+        try:
+            _dialog.remove_analysis()
+            _dialog.close()
+        except Exception:
+            pass
+    _dialog = WallThicknessDialog()
+    _dialog.show()
+
+
+main()

@@ -1,0 +1,202 @@
+# SPDX-License-Identifier: MIT
+#
+# Copyright (c) 2026 daredevildexter
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+#
+# FreeCAD 1.0 - Physical Properties
+# Select one solid or a shape containing solids, run macro, and calculate.
+
+import FreeCAD as App
+import FreeCADGui as Gui
+
+try:
+    from PySide import QtGui
+    QtWidgets = QtGui
+except ImportError:
+    from PySide2 import QtWidgets
+
+
+class PhysicalPropertiesDialog(QtWidgets.QDialog):
+    def __init__(self):
+        super(PhysicalPropertiesDialog, self).__init__()
+        self.obj = None
+        self.setWindowTitle("Physical Properties")
+        self.setMinimumWidth(590)
+        self.build_ui()
+        self.pick_current_selection(silent=True)
+
+    def build_ui(self):
+        layout = QtWidgets.QVBoxLayout(self)
+
+        title = QtWidgets.QLabel(
+            "Calculate surface area, volume, mass, bounding box and center of gravity.\n"
+            "Density is entered manually in g/cm3."
+        )
+        layout.addWidget(title)
+
+        select_row = QtWidgets.QHBoxLayout()
+        select_row.addWidget(QtWidgets.QLabel("Selected object:"))
+        self.object_edit = QtWidgets.QLineEdit()
+        self.object_edit.setReadOnly(True)
+        select_row.addWidget(self.object_edit, 1)
+        self.select_btn = QtWidgets.QPushButton("Use Selected Object")
+        self.select_btn.clicked.connect(self.pick_current_selection)
+        select_row.addWidget(self.select_btn)
+        layout.addLayout(select_row)
+
+        density_row = QtWidgets.QHBoxLayout()
+        density_row.addWidget(QtWidgets.QLabel("Density:"))
+        self.density = QtWidgets.QDoubleSpinBox()
+        self.density.setDecimals(5)
+        self.density.setRange(0.00001, 100.0)
+        self.density.setValue(1.00000)
+        self.density.setSingleStep(0.01)
+        self.density.setSuffix(" g/cm3")
+        density_row.addWidget(self.density)
+        density_row.addStretch(1)
+        layout.addLayout(density_row)
+
+        preset_row = QtWidgets.QHBoxLayout()
+        preset_row.addWidget(QtWidgets.QLabel("Quick density:"))
+        presets = [
+            ("1.00", 1.00), ("PP 0.90", 0.90), ("PE 0.95", 0.95),
+            ("ABS 1.04", 1.04), ("PA6 1.13", 1.13), ("PC 1.20", 1.20),
+            ("POM 1.41", 1.41)
+        ]
+        for text, value in presets:
+            b = QtWidgets.QPushButton(text)
+            b.clicked.connect(lambda checked=False, v=value: self.density.setValue(v))
+            preset_row.addWidget(b)
+        layout.addLayout(preset_row)
+
+        self.calculate_btn = QtWidgets.QPushButton("Calculate Physical Properties")
+        self.calculate_btn.clicked.connect(self.calculate)
+        layout.addWidget(self.calculate_btn)
+
+        self.results = QtWidgets.QPlainTextEdit()
+        self.results.setReadOnly(True)
+        self.results.setMinimumHeight(330)
+        layout.addWidget(self.results)
+
+        buttons = QtWidgets.QHBoxLayout()
+        self.copy_btn = QtWidgets.QPushButton("Copy Results")
+        self.copy_btn.clicked.connect(self.copy_results)
+        close_btn = QtWidgets.QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        buttons.addWidget(self.copy_btn)
+        buttons.addStretch(1)
+        buttons.addWidget(close_btn)
+        layout.addLayout(buttons)
+
+    def pick_current_selection(self, silent=False):
+        sel = Gui.Selection.getSelection()
+        if len(sel) != 1:
+            if not silent:
+                QtWidgets.QMessageBox.warning(self, "Selection", "Select exactly one object in the 3D view or model tree.")
+            return
+        obj = sel[0]
+        if not hasattr(obj, "Shape") or obj.Shape.isNull():
+            if not silent:
+                QtWidgets.QMessageBox.warning(self, "Selection", "The selected object has no usable Part Shape.")
+            return
+        if len(obj.Shape.Solids) == 0:
+            if not silent:
+                QtWidgets.QMessageBox.warning(self, "Selection", "The selected shape contains no solid. Volume, mass and center of gravity require solid geometry.")
+            return
+        self.obj = obj
+        self.object_edit.setText(obj.Label)
+
+    @staticmethod
+    def fmt(value, decimals=3):
+        return ("{:, .%df}" % decimals).format(value).strip()
+
+    def calculate(self):
+        if self.obj is None:
+            self.pick_current_selection()
+            if self.obj is None:
+                return
+
+        try:
+            shape = self.obj.Shape
+            if shape.isNull() or len(shape.Solids) == 0:
+                raise RuntimeError("The selected object no longer contains usable solid geometry.")
+
+            # FreeCAD base geometry units are mm, so Area is mm2 and Volume is mm3.
+            area_mm2 = float(shape.Area)
+            volume_mm3 = float(shape.Volume)
+            bbox = shape.BoundBox
+
+            # Robust combined center of gravity for one or more solids.
+            solids = list(shape.Solids)
+            total_vol = sum(float(s.Volume) for s in solids)
+            if total_vol <= 0.0:
+                raise RuntimeError("Solid volume is zero; center of gravity and mass cannot be calculated.")
+            cg_x = sum(float(s.CenterOfMass.x) * float(s.Volume) for s in solids) / total_vol
+            cg_y = sum(float(s.CenterOfMass.y) * float(s.Volume) for s in solids) / total_vol
+            cg_z = sum(float(s.CenterOfMass.z) * float(s.Volume) for s in solids) / total_vol
+
+            density_g_cm3 = float(self.density.value())
+            volume_cm3 = volume_mm3 / 1000.0
+            mass_g = volume_cm3 * density_g_cm3
+            mass_kg = mass_g / 1000.0
+
+            lines = []
+            lines.append("PHYSICAL PROPERTIES")
+            lines.append("=" * 54)
+            lines.append("Object: %s" % self.obj.Label)
+            lines.append("Density: %.5f g/cm3" % density_g_cm3)
+            lines.append("")
+            lines.append("GEOMETRY")
+            lines.append("Surface area : %.3f mm2" % area_mm2)
+            lines.append("               %.3f cm2" % (area_mm2 / 100.0))
+            lines.append("Volume       : %.3f mm3" % volume_mm3)
+            lines.append("               %.3f cm3" % volume_cm3)
+            lines.append("")
+            lines.append("MASS")
+            lines.append("Mass         : %.3f g" % mass_g)
+            lines.append("               %.6f kg" % mass_kg)
+            lines.append("")
+            lines.append("BOUNDING BOX - GLOBAL COORDINATES")
+            lines.append("X min / max  : %.3f / %.3f mm" % (bbox.XMin, bbox.XMax))
+            lines.append("Y min / max  : %.3f / %.3f mm" % (bbox.YMin, bbox.YMax))
+            lines.append("Z min / max  : %.3f / %.3f mm" % (bbox.ZMin, bbox.ZMax))
+            lines.append("Size X       : %.3f mm" % bbox.XLength)
+            lines.append("Size Y       : %.3f mm" % bbox.YLength)
+            lines.append("Size Z       : %.3f mm" % bbox.ZLength)
+            lines.append("")
+            lines.append("CENTER OF GRAVITY - GLOBAL COORDINATES")
+            lines.append("X            : %.3f mm" % cg_x)
+            lines.append("Y            : %.3f mm" % cg_y)
+            lines.append("Z            : %.3f mm" % cg_z)
+            lines.append("")
+            lines.append("Solids included: %d" % len(solids))
+            lines.append("Note: uniform density is assumed throughout the selected object.")
+
+            self.results.setPlainText("\n".join(lines))
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Calculation error", str(exc))
+
+    def copy_results(self):
+        QtWidgets.QApplication.clipboard().setText(self.results.toPlainText())
+
+
+dlg = PhysicalPropertiesDialog()
+dlg.show()
+Gui.PhysicalPropertiesDialog = dlg

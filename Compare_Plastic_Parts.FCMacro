@@ -1,0 +1,273 @@
+# SPDX-License-Identifier: MIT
+#
+# Copyright (c) 2026 daredevildexter
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+#
+# FreeCAD 1.0 - Compare Plastic Parts
+# Select OLD and NEW using the dialog, then compare.
+
+import FreeCAD as App
+import FreeCADGui as Gui
+import time
+
+try:
+    from PySide import QtCore, QtGui
+    QtWidgets = QtGui
+except ImportError:
+    from PySide2 import QtCore, QtWidgets
+
+
+class CompareDialog(QtWidgets.QDialog):
+    def __init__(self):
+        super(CompareDialog, self).__init__()
+        self.setWindowTitle("Compare Plastic Parts")
+        self.setMinimumWidth(520)
+        self.old_obj = None
+        self.new_obj = None
+        self.running = False
+        self.build_ui()
+
+    def build_ui(self):
+        layout = QtWidgets.QVBoxLayout(self)
+
+        info = QtWidgets.QLabel(
+            "Part 1 = old/reference part\n"
+            "Part 2 = new/revised part\n\n"
+            "Green = common   Blue = added   Red = removed"
+        )
+        layout.addWidget(info)
+
+        grid = QtWidgets.QGridLayout()
+        self.old_edit = QtWidgets.QLineEdit()
+        self.old_edit.setReadOnly(True)
+        self.new_edit = QtWidgets.QLineEdit()
+        self.new_edit.setReadOnly(True)
+
+        self.old_btn = QtWidgets.QPushButton("Select Part 1")
+        self.new_btn = QtWidgets.QPushButton("Select Part 2")
+        self.old_btn.clicked.connect(self.pick_old)
+        self.new_btn.clicked.connect(self.pick_new)
+
+        grid.addWidget(QtWidgets.QLabel("Part 1 (OLD):"), 0, 0)
+        grid.addWidget(self.old_edit, 0, 1)
+        grid.addWidget(self.old_btn, 0, 2)
+        grid.addWidget(QtWidgets.QLabel("Part 2 (NEW):"), 1, 0)
+        grid.addWidget(self.new_edit, 1, 1)
+        grid.addWidget(self.new_btn, 1, 2)
+        layout.addLayout(grid)
+
+        self.progress = QtWidgets.QProgressBar()
+        self.progress.setRange(0, 5)
+        self.progress.setValue(0)
+        layout.addWidget(self.progress)
+
+        self.status = QtWidgets.QLabel("Ready. Select the two parts.")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+
+        self.log = QtWidgets.QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMinimumHeight(150)
+        layout.addWidget(self.log)
+
+        buttons = QtWidgets.QHBoxLayout()
+        self.start_btn = QtWidgets.QPushButton("Start Comparison")
+        self.close_btn = QtWidgets.QPushButton("Close")
+        self.start_btn.clicked.connect(self.compare)
+        self.close_btn.clicked.connect(self.close)
+        buttons.addWidget(self.start_btn)
+        buttons.addWidget(self.close_btn)
+        layout.addLayout(buttons)
+
+    def process_events(self):
+        App.GuiUp and QtWidgets.QApplication.processEvents()
+
+    def set_stage(self, n, text):
+        self.progress.setValue(n)
+        self.status.setText("[%d/5] %s" % (n, text))
+        self.log.appendPlainText("[%d/5] %s" % (n, text))
+        self.process_events()
+
+    def log_time(self, label, seconds):
+        self.log.appendPlainText("    %s: %.2f s" % (label, seconds))
+        self.process_events()
+
+    def selected_single_object(self):
+        sel = Gui.Selection.getSelection()
+        if len(sel) != 1:
+            QtWidgets.QMessageBox.warning(self, "Selection", "Select exactly one object in the 3D view/tree.")
+            return None
+        obj = sel[0]
+        if not hasattr(obj, "Shape") or obj.Shape.isNull():
+            QtWidgets.QMessageBox.warning(self, "Selection", "The selected object has no usable Part Shape.")
+            return None
+        return obj
+
+    def pick_old(self):
+        obj = self.selected_single_object()
+        if obj:
+            self.old_obj = obj
+            self.old_edit.setText(obj.Label)
+
+    def pick_new(self):
+        obj = self.selected_single_object()
+        if obj:
+            self.new_obj = obj
+            self.new_edit.setText(obj.Label)
+
+    def remove_old_results(self, doc):
+        old_group = doc.getObject("Part_Comparison")
+        if old_group:
+            # Delete members first, then group.
+            for child in list(old_group.Group):
+                try:
+                    doc.removeObject(child.Name)
+                except Exception:
+                    pass
+            try:
+                doc.removeObject(old_group.Name)
+            except Exception:
+                pass
+            doc.recompute()
+
+    def create_result(self, doc, group, name, label, shape, color):
+        if shape is None or shape.isNull():
+            self.log.appendPlainText("    %s result is empty." % label)
+            return None
+        obj = doc.addObject("Part::Feature", name)
+        obj.Label = label
+        obj.Shape = shape
+        obj.ViewObject.ShapeColor = color
+        obj.ViewObject.LineColor = color
+        obj.ViewObject.Transparency = 0
+        group.addObject(obj)
+        return obj
+
+    def compare(self):
+        if self.running:
+            return
+        if self.old_obj is None or self.new_obj is None:
+            QtWidgets.QMessageBox.warning(self, "Missing parts", "Select both OLD and NEW parts first.")
+            return
+        if self.old_obj == self.new_obj:
+            QtWidgets.QMessageBox.warning(self, "Selection", "OLD and NEW must be different objects.")
+            return
+
+        doc = App.ActiveDocument
+        if doc is None:
+            QtWidgets.QMessageBox.critical(self, "Error", "No active FreeCAD document.")
+            return
+
+        self.running = True
+        self.start_btn.setEnabled(False)
+        self.old_btn.setEnabled(False)
+        self.new_btn.setEnabled(False)
+        self.progress.setValue(0)
+        self.log.clear()
+        total_start = time.time()
+
+        try:
+            # Stage 1: inexpensive validation only. No volume calculation.
+            self.set_stage(1, "Checking input shapes...")
+            t = time.time()
+            old_shape = self.old_obj.Shape.copy()
+            new_shape = self.new_obj.Shape.copy()
+            if old_shape.isNull() or new_shape.isNull():
+                raise RuntimeError("One of the input shapes is null.")
+            if len(old_shape.Solids) == 0 or len(new_shape.Solids) == 0:
+                raise RuntimeError("Both inputs must contain at least one solid.")
+            self.remove_old_results(doc)
+            self.log_time("Input preparation", time.time() - t)
+
+            # Stage 2
+            self.set_stage(2, "Calculating COMMON geometry (green)...")
+            self.status.setText("[2/5] Calculating COMMON geometry... FreeCAD may be busy during this Boolean operation.")
+            self.process_events()
+            t = time.time()
+            common_shape = old_shape.common(new_shape)
+            self.log_time("COMMON", time.time() - t)
+
+            # Stage 3
+            self.set_stage(3, "Calculating ADDED material (blue)...")
+            self.status.setText("[3/5] Calculating ADDED material... FreeCAD may be busy during this Boolean operation.")
+            self.process_events()
+            t = time.time()
+            added_shape = new_shape.cut(old_shape)
+            self.log_time("ADDED", time.time() - t)
+
+            # Stage 4
+            self.set_stage(4, "Calculating REMOVED material (red)...")
+            self.status.setText("[4/5] Calculating REMOVED material... FreeCAD may be busy during this Boolean operation.")
+            self.process_events()
+            t = time.time()
+            removed_shape = old_shape.cut(new_shape)
+            self.log_time("REMOVED", time.time() - t)
+
+            # Stage 5
+            self.set_stage(5, "Creating comparison display...")
+            t = time.time()
+            group = doc.addObject("App::DocumentObjectGroup", "Part_Comparison")
+            group.Label = "Part Comparison"
+
+            self.create_result(doc, group, "Comparison_Common", "COMMON - Unchanged", common_shape, (0.20, 0.80, 0.20))
+            self.create_result(doc, group, "Comparison_Added", "ADDED - New Material", added_shape, (0.10, 0.30, 1.00))
+            self.create_result(doc, group, "Comparison_Removed", "REMOVED - Old Material", removed_shape, (1.00, 0.10, 0.10))
+
+            self.old_obj.ViewObject.Visibility = False
+            self.new_obj.ViewObject.Visibility = False
+            doc.recompute()
+            Gui.activeDocument().activeView().viewAxonometric()
+            Gui.activeDocument().activeView().fitAll()
+            self.log_time("Display", time.time() - t)
+
+            total = time.time() - total_start
+            self.status.setText("Comparison complete in %.2f seconds." % total)
+            self.log.appendPlainText("\nCOMPLETED - Total: %.2f s" % total)
+            self.log.appendPlainText("Green = common | Blue = added | Red = removed")
+            self.process_events()
+
+        except Exception as exc:
+            self.status.setText("Comparison stopped because of an error.")
+            self.log.appendPlainText("\nERROR: %s" % str(exc))
+            QtWidgets.QMessageBox.critical(self, "Comparison error", str(exc))
+        finally:
+            self.running = False
+            self.start_btn.setEnabled(True)
+            self.old_btn.setEnabled(True)
+            self.new_btn.setEnabled(True)
+            self.process_events()
+
+    def closeEvent(self, event):
+        if self.running:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Comparison running",
+                "A FreeCAD/OpenCASCADE Boolean operation is currently running. "
+                "It cannot be safely cancelled from this dialog. Please wait for the current stage to finish."
+            )
+            event.ignore()
+        else:
+            event.accept()
+
+
+dlg = CompareDialog()
+dlg.show()
+# Keep a reference so the dialog is not garbage-collected.
+Gui.ComparePlasticPartsDialog = dlg
